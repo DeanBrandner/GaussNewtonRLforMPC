@@ -145,13 +145,15 @@ def train(n_processes:int, agent_path:str, rl_settings: dict = {}, n_episodes_pe
     return
 
 if __name__ == "__main__":
-    n_mpc_processes = min(int(os.cpu_count() / 2), 50)
+    n_mpc_processes = min(int(os.cpu_count() / 2) - 1, 50)
     n_episodes_per_replay = 100
 
     actor_learning_rate = 0.1
     use_momentum = True
     use_adam = False
 
+    # You can enter multiple values for beta and eta in these lists.
+    # Example: momentum_beta_list = [0.75, 0.9, 0.99] 
     momentum_beta_list = [0.75]
     momentum_eta_list = [0.9]
 

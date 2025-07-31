@@ -184,8 +184,8 @@ def compute_parametric_performance(parametric_results_path:str, param_range_alph
 
 if __name__ == "__main__":
     # Define parameter ranges for medium parameterization
-    param_medium_alpha_beta_range_alpha = np.linspace(-0.05, 0.10, 2) # Placeholder for medium parameterization
-    param_medium_alpha_beta_range_beta = np.linspace(-0.75, 0.1, 2)  # Placeholder for medium parameterization
+    param_medium_alpha_beta_range_alpha = np.linspace(-0.05, 0.10, 21) # Placeholder for medium parameterization
+    param_medium_alpha_beta_range_beta = np.linspace(-0.75, 0.1, 21)  # Placeholder for medium parameterization
 
     # Set number of processes and initial conditions
     n_mpc_processes = min(os.cpu_count() // 2 - 1, 50)
