@@ -1,0 +1,6 @@
+
+CSTR/__pycache__/
+
+CSTR/training/__pycache__/
+
+*.db
