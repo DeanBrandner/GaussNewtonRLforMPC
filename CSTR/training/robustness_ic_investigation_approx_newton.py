@@ -1,32 +1,59 @@
-import os
-import pickle
+import os, pickle, time, gc
 import casadi as cd
 import pandas as pd
 import numpy as np
-import tensorflow as tf
 
-from mpc_collection import get_rl_mpc
-from mp_utils import run_episode_loop
-
-from rl_mpc_agents import RL_MPC_AN_agent as Agent
-
-from environments import CSTR as Environment
 from multiprocessing import Process, Queue, Value
-
 from tqdm import tqdm
-import time
+
+from mp_utils import run_episode_loop
+from rl_mpc_agents import RL_MPC_AN_agent as Agent
+from environments import CSTR as Environment
 
 
-def train(n_processes:int, agent_path:str, rl_settings: dict = {}, n_episodes_per_replay: int = 50, initial_guess_idx: int = 0):
 
-    mpc = get_rl_mpc()
+global_seed = 42
 
+
+def train(
+        n_processes:int,
+        penalty_weights,
+        agent_path:str,
+        rl_settings: dict = {},
+        n_episodes_per_replay: int = 50,
+        scale_type: str = "unscaled",
+        initial_guess_idx: int = 0,
+        measurement_noise: bool = False,
+        additive_process_noise: bool = False,
+        parametric_uncertainty: bool = False,
+        ):
+
+    if scale_type == "unscaled":
+        from mpc_collection import get_rl_mpc
+    elif scale_type == "scaled":
+        from mpc_collection import get_rl_mpc_scaled_params as get_rl_mpc
+    elif scale_type == "malscaled":
+        from mpc_collection import get_rl_mpc_malscaled_params as get_rl_mpc
+    else:
+        raise ValueError(f"Unknown scale_type: {scale_type}")
+
+    mpc = get_rl_mpc(penalty_weights)
     agent = Agent(mpc, rl_settings, init_differentiator = True)
     
     if initial_guess_idx > 0:
-        param_lb = np.array([-0.05, -0.75]).reshape(-1, 1)
-        param_ub = np.array([+0.07, +0.10]).reshape(-1, 1)
-        initial_guess_rng = np.random.default_rng(initial_guess_idx)
+        if scale_type == "unscaled":
+            param_lb = np.array([-0.10, -0.50]).reshape(-1, 1)
+            param_ub = np.array([+0.10, +0.50]).reshape(-1, 1)
+        elif scale_type == "scaled":
+            param_lb = np.array([-1.0, -0.50]).reshape(-1, 1)
+            param_ub = np.array([+1.0, +0.50]).reshape(-1, 1)
+        elif scale_type == "malscaled":
+            param_lb = np.array([-0.01, -0.50]).reshape(-1, 1)
+            param_ub = np.array([+0.01, +0.50]).reshape(-1, 1)
+        else:
+            raise ValueError(f"Unknown scale_type: {scale_type}")
+
+        initial_guess_rng = np.random.default_rng(global_seed + initial_guess_idx)
         parameters = param_lb + (param_ub - param_lb) * initial_guess_rng.uniform(0, 1, size = mpc.p_fun(0).master.shape)
         parameters = cd.DM(parameters)
     else:
@@ -45,13 +72,12 @@ def train(n_processes:int, agent_path:str, rl_settings: dict = {}, n_episodes_pe
     # Start the workers
     workers = []
     for i in range(n_processes):
-        worker = Process(target = run_episode_loop, args = (get_rl_mpc, Agent, rl_settings, Environment, agent_path, task_queue, environment_queue, progress_counter))
+        worker = Process(target = run_episode_loop, args = (get_rl_mpc, penalty_weights, Agent, rl_settings, Environment, agent_path, task_queue, environment_queue, progress_counter))
         workers.append(worker)
         worker.start()
 
     agent.save(os.path.join(agent_path, f"agent_update"))
     agent.save_rl_parameters(os.path.join(agent_path, f"agent_update_0"))
-    agent.save_q_func(os.path.join(agent_path, f"agent_update_0"))
 
     # Do the training
     n_replays = 101
@@ -79,6 +105,10 @@ def train(n_processes:int, agent_path:str, rl_settings: dict = {}, n_episodes_pe
                 "parameters": agent.mpc.p_fun(0).master,
                 "max_steps_of_violation": 1,  # This can be adjusted based on the environment
                 "training": True,
+                "measurement_noise": measurement_noise,
+                "additive_process_noise": additive_process_noise,
+                "parametric_uncertainty": parametric_uncertainty,
+                "diff_twice": True
             })
 
         gathered_results = []
@@ -86,7 +116,6 @@ def train(n_processes:int, agent_path:str, rl_settings: dict = {}, n_episodes_pe
             env_results = environment_queue.get()
 
             gathered_results.append(env_results)
-            # monitor.append(env_results)
 
             with progress_counter.get_lock():
                 completed = progress_counter.value
@@ -103,7 +132,8 @@ def train(n_processes:int, agent_path:str, rl_settings: dict = {}, n_episodes_pe
         episode_time_list = []
         for result in gathered_results:
             data = result["data"]
-            cum_reward_list.append(data.r.sum())
+            cum_reward = [agent.settings.gamma ** k * item for k, item in enumerate(data.r)]
+            cum_reward_list.append(np.sum(cum_reward))
             stage_cost_list.append(data.stage_cost.sum())
             penalty_list.append(data.penalty.sum())
             termination_list.append(int(result["termination"]))
@@ -136,11 +166,12 @@ def train(n_processes:int, agent_path:str, rl_settings: dict = {}, n_episodes_pe
         print(agent.mpc.p_fun(0)["_p"])
 
         agent.save_rl_parameters(os.path.join(agent_path, f"agent_update_{replay_idx + 1}"))
-        agent.save_q_func(os.path.join(agent_path, f"agent_update_{replay_idx + 1}"))
         with open(os.path.join(agent_path, f"agent_update_{replay_idx}", "policy_gradients.pkl"), "wb") as f:
             pickle.dump(policy_gradient, f)
         with open(os.path.join(agent_path, f"agent_update_{replay_idx}", "policy_hessian.pkl"), "wb") as f:
             pickle.dump(policy_hessian, f)
+
+        agent.performance_data.to_csv(os.path.join(agent_path, "performance_data.csv"))
 
         end_time = time.time()
 
@@ -164,60 +195,62 @@ def train(n_processes:int, agent_path:str, rl_settings: dict = {}, n_episodes_pe
 if __name__ == "__main__":
 
     n_mpc_processes = min(int(os.cpu_count() // 2) - 1, 50)
-    n_episodes_per_replay = 100
+    n_episodes_per_replay = 200
 
-    n_initial_guesses_for_rl_params = 5
+    n_initial_guesses_for_rl_params = [0, 1, 2, 3, 4]
+    scale = ["malscaled", "unscaled", "scaled"]
 
-    actor_learning_rate = 1e-1
+    actor_learning_rate = 1e-2
+    trust_region_radius = actor_learning_rate
     use_momentum = True
-    use_adam = False
     beta = 0.75
+    beta_2 = 0.999
     eta = 0.9
-    omegainv = 1e2
+    gamma = 0.99
+
+    tight_init = False
+    penalty_weight = 100.0
+    terminal_cost_approx = False
+    measurement_noise = False
+    additive_process_uncertainty = True
+    parametric_uncertainty = True
 
 
     rl_settings = {
-            "gamma": 1.0,
-            "exploration_noise": 1e-2 * np.abs(np.array([40 - 5, -8500 - 0])).reshape(-1, 1),
-            "exploration_distribution": "normal",
-            "exploration_seed": 1,
+            "gamma": gamma,
             "actor_learning_rate": actor_learning_rate,
-
-            "q_func_architecture": [64, 32],
-            "q_func_activation": "gelu",
-            "q_func_optimizer": "adam",
-            "q_func_learning_rate": 1e-3,
-            "q_func_loss": "mse",
-            "q_func_batch_size": 128,
-            "q_func_epochs": 500,
-            "q_func_always_reset": False,
-
-            "clip_q_gradients": True,
-            "clip_jac_policy": True,
+            "adaptive_trust_region": True,
             "use_momentum": use_momentum,
-            "use_adam": use_adam,
             "momentum_beta": beta,
-            "momentum_eta": eta,
-            "omegainv": omegainv
+            "momentum_beta_2": beta_2,
+            "momentum_eta": eta
         }
 
+    for scale_type in scale:
+        for idx in n_initial_guesses_for_rl_params:
+            agent_path = os.path.join(
+                "CSTR",
+                "data",
+                "ic_investigation",
+                f"gamma{gamma:.3f}, n_IC_per_replay{n_episodes_per_replay}",
+                f"scale_type_{scale_type}",
+                f"approx_newton_rad_{actor_learning_rate:.1e}_beta_{beta:.2f}_beta2_{beta_2:.3f}_eta_{eta:.3f}",
+                f"IC_{idx}"
+                )
 
-    for idx in range(n_initial_guesses_for_rl_params):
-        agent_path = os.path.join("CSTR", "data", "ic_investigation", f"approx_newton", f"lr{actor_learning_rate:.1e}_nIC{n_episodes_per_replay}_beta_{beta:.2f}_eta_{eta:.3f}_omegainv_{omegainv:.1e}", f"initial_guess_{idx}")
+            gc.collect()
+                    
+            start_time = time.time()
+            train(n_mpc_processes, penalty_weight, agent_path, rl_settings, n_episodes_per_replay, scale_type, idx, measurement_noise, additive_process_uncertainty, parametric_uncertainty)
+            end_time = time.time()
 
-        tf.keras.backend.clear_session()
-                
-        start_time = time.time()
-        train(n_mpc_processes, agent_path, rl_settings, n_episodes_per_replay, idx)
-        end_time = time.time()
+            print(f"Training time: {end_time - start_time:.2f} seconds")
+            print(f"Training time: {(end_time - start_time) / 60:.2f} minutes")
+            print(f"Training time: {(end_time - start_time) / 3600:.2f} hours")
+            print(f"Training time: {(end_time - start_time) / 86400:.2f} days")
 
-        print(f"Training time: {end_time - start_time:.2f} seconds")
-        print(f"Training time: {(end_time - start_time) / 60:.2f} minutes")
-        print(f"Training time: {(end_time - start_time) / 3600:.2f} hours")
-        print(f"Training time: {(end_time - start_time) / 86400:.2f} days")
-
-        with open(os.path.join(agent_path, "training_time.txt"), "w") as f:
-            f.write(f"Training time: {end_time - start_time:.2f} seconds\n")
-            f.write(f"Training time: {(end_time - start_time) / 60:.2f} minutes\n")
-            f.write(f"Training time: {(end_time - start_time) / 3600:.2f} hours\n")
-            f.write(f"Training time: {(end_time - start_time) / 86400:.2f} days\n")
+            with open(os.path.join(agent_path, "training_time.txt"), "w") as f:
+                f.write(f"Training time: {end_time - start_time:.2f} seconds\n")
+                f.write(f"Training time: {(end_time - start_time) / 60:.2f} minutes\n")
+                f.write(f"Training time: {(end_time - start_time) / 3600:.2f} hours\n")
+                f.write(f"Training time: {(end_time - start_time) / 86400:.2f} days\n")

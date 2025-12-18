@@ -23,8 +23,42 @@ def tensor_vector_product(tensor: np.ndarray, vector: np.ndarray) -> np.ndarray:
     vector = np.expand_dims(vector, axis=-1)
     
     # Perform element-wise multiplication and sum over the action dimension
-    result = np.sum(tensor * vector, axis=1)
+    if len(tensor.shape) == 3:
+        axis = 0
+    elif len(tensor.shape) == 4:
+        axis = 1
+    result = np.sum(tensor * vector, axis=axis)
     return result
+
+def matrix_tensor_matrix_product(matrix_left: np.ndarray, tensor: np.ndarray, matrix_right: np.ndarray) -> np.ndarray:
+    """
+    Compute matrix_left @ tensor[..., :, :] @ matrix_right using einsum.
+    Supports tensor with shape (n, m, m) -> output (n, p, q)
+    and (batchsize, n, m, m) -> output (batchsize, n, p, q), where
+    matrix_left has shape (batchsize, p, m) and matrix_right has shape (batchsize, m, q).
+    """
+    L = np.asarray(matrix_left)
+    T = np.asarray(tensor)
+    R = np.asarray(matrix_right)
+
+    if T.ndim == 3:
+        # L_{a b}, T_{n b c}, R_{c d} -> O_{n a d}
+        return np.einsum('ab, nbc, cd -> nad', L, T, R)
+    elif T.ndim == 4:
+        # L_{i a b}, T_{i j b c}, R_{i c d} -> O_{i j a d}
+        return np.einsum('sab, snbc, scd -> snad', L, T, R)
+    else:
+        raise ValueError("Tensor must be 3D or 4D.")
+    
+def tensor_matrix_product(tensor: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+
+    if tensor.ndim == 3:
+        return np.einsum('abc, da -> dbc', tensor, matrix)
+    elif tensor.ndim == 4:
+        return np.einsum('iabc, da -> idbc', tensor, matrix)
+    else:
+        raise ValueError("Tensor must be 3D or 4D.")
+    
 
 
 class Noise_generator:
@@ -168,9 +202,15 @@ class NLPDifferentiatorSettings_RL():
 
 class NLP_differentiator:
 
-    def __init__(self, mpc: RL_MPC = None, **kwargs):
+    def __init__(self, mpc: RL_MPC = None, wrt: list[str] = ["_p"], **kwargs):
         
+        if not isinstance(wrt, list) and isinstance(wrt, str):
+            wrt = [wrt]
+        elif not isinstance(wrt, list) or not all(isinstance(item, str) for item in wrt):
+            raise ValueError("wrt must be a string or a list of strings.")
+
         self.mpc = mpc
+        self.wrt = wrt
 
         self.nlp, self.nlp_bounds = self._get_do_mpc_nlp()
 
@@ -188,8 +228,16 @@ class NLP_differentiator:
 
 
         opt_p = mpc.opt_p.master
-        _p = mpc.opt_p["_p", 0]
-        self._p_extractor = cd.Function("p_extractor", [opt_p], [_p], ["opt_p"], ["p"])
+        _p_list = []
+        for item in self.wrt:
+            _p = mpc.opt_p[item]
+            if item == "_p":
+                _p = _p[0]
+            _p_list.append(_p)
+        _p = cd.vertcat(*_p_list)
+
+        out_name = ", ".join(self.wrt)
+        self._p_extractor = cd.Function("p_extractor", [opt_p], [_p], ["opt_p"], [out_name])
 
         self._prepare_differentiator()
 
@@ -276,9 +324,10 @@ class NLP_differentiator:
         jac_action_parameters = self._u0_extractor(dx_dp_num)
         
         jac_action_parameters = jac_action_parameters * self.u_scaling_factors.full().reshape(self.n_u, 1)
-        jac_action_parameters = jac_action_parameters.full()
 
+        jac_action_parameters = jac_action_parameters.full()
         return jac_action_parameters
+        
     
     def jac_jac_action_parameters_parameters(self, mpc):
         if not isinstance(mpc, dict):
@@ -329,12 +378,14 @@ class NLP_differentiator:
 
         # Handle the dimensions of jac_jac_action_parameters_parameters
         jac_jac_action_parameters_parameters = self._make_symmetric_tensor(jac_jac_action_parameters_parameters)
-        
+
         jac_action_parameters = jac_action_parameters * self.u_scaling_factors.full().reshape(self.n_u, 1)
-        jac_action_parameters = jac_action_parameters.full()
         jac_jac_action_parameters_parameters = jac_jac_action_parameters_parameters * self.u_scaling_factors.full().reshape(self.n_u, 1, 1)
 
+        jac_action_parameters = jac_action_parameters.full()
         return jac_action_parameters, jac_jac_action_parameters_parameters
+
+
     
     def _make_symmetric_tensor(self, jac_jac_action_parameters_parameters: cd.DM):
 
@@ -496,7 +547,7 @@ class NLP_differentiator:
         """
         self.n_x = self.nlp["x"].shape[0]
         self.n_g = self.nlp["g"].shape[0]
-        self.n_p = self._p_extractor(self.nlp["p"]).shape[0]
+        self.n_p = self._p_extractor.size1_out(*self._p_extractor.name_out())
         self.n_u = self._u0_extractor(0).shape[0]
 
     def _get_sym_lagrange_multipliers(self):
@@ -800,7 +851,6 @@ class NLP_differentiator:
         # Setup B matrix
         self.B_sym = cd.jacobian(self.F, RL_p)
         self.B_func = cd.Function("B", [x, lag_x_all, lag_g_all, p], [self.B_sym], ["x_opt", "lag_x_opt", "lag_g_opt", "p_opt"], ["B"])
-
 
 
         if self.settings.second_order:

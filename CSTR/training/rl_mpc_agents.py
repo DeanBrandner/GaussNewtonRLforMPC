@@ -1,29 +1,11 @@
+import os, pickle, time
 import numpy as np
 import casadi as cd
-import pickle
-import os
-from RL_MPC import RL_MPC
-from helper import NLP_differentiator, tensor_vector_product, Noise_generator
+
 from dataclasses import dataclass, field
 
-from Q_func_model import Q_approximator
-
-from keras.src.utils import set_random_seed
-set_random_seed(1)
-
-from keras.src.backend import set_floatx
-set_floatx("float64")
-
-from keras.src.models import Model as keras_model
-from keras.src.layers import Dense, Input, Concatenate
-from keras.src.saving import load_model as load_nn_model
-from keras.src.callbacks import ReduceLROnPlateau, ModelCheckpoint, EarlyStopping
-
-from sklearn.preprocessing import MinMaxScaler
-
-from tensorflow import GradientTape, constant
-from tensorflow.random import set_seed as tf_set_seed
-tf_set_seed(1)
+from RL_MPC import RL_MPC
+from helper import NLP_differentiator, tensor_vector_product, matrix_tensor_matrix_product, tensor_matrix_product
 
 @dataclass
 class Flags:
@@ -34,19 +16,13 @@ class Flags:
 class RL_settings:
     gamma: float = 1.
     actor_learning_rate: float = 1e-3
+    adaptive_trust_region: bool = False
+    trust_region_radius: float = 1e-2
+    scale_tr_radius_to_dimension: bool = False
     exploration_noise: np.ndarray = 1e-6
     exploration_distribution: str = "normal"
     exploration_seed: int = 1
     verbose: int = 1
-
-    q_func_architecture: list = field(default_factory= lambda: [64, 64])
-    q_func_activation: str = "tanh"
-    q_func_learning_rate: float = 1e-3
-    q_func_batch_size: int = 64
-    q_func_optimizer: str = "adam"
-    q_func_loss: str = "mse"
-    q_func_epochs: int = 10
-    q_func_always_reset: bool = False
 
     regularization: str = "pos_eigen"
     clip_q_gradients: bool = False
@@ -54,13 +30,59 @@ class RL_settings:
     use_momentum: bool = False
     use_adam: bool = False
     momentum_beta: float = 0.75
+    momentum_beta_2: float = 0.999
     momentum_eta: float = 0.9
     adam_beta_1: float = 0.9
     adam_beta_2: float = 0.999
     adam_epsilon: float = 1e-8
-    omegainv: float = 10
-    use_scaled_actions: bool = True
+    omegainv: float = 10.0
+    D_history_length: int = 5
+    use_scaled_actions: bool = False
 
+@dataclass()
+class Performance_data:
+    episode: list = field(default_factory=list)
+    n_samples: list = field(default_factory=list)
+    time_replay: list = field(default_factory=list)
+
+    def __init__(self):
+        super().__init__()
+        self.episode = [0]
+        self.n_samples = []
+        self.time_replay = []
+
+    def update(self, agent):
+        self.episode.append(self.episode[-1] + 1)
+        self.n_samples.append(agent.observed_states.shape)
+        self.time_replay.append(agent._time_replay)
+        return
+
+    def to_csv(self, path: str):
+        
+        episode_to_save = self.episode[:-1]
+        n_samples_to_save = self.n_samples
+        time_replay_to_save = self.time_replay
+
+        from pandas import DataFrame
+        df = DataFrame({
+            "episode": episode_to_save,
+            "n_samples": n_samples_to_save,
+            "time_replay": time_replay_to_save
+        })
+        if not os.path.exists(os.path.dirname(path)):
+            os.makedirs(os.path.dirname(path))
+        df.to_csv(path, index = False)
+
+    @classmethod
+    def from_csv(cls, path: str):
+        from pandas import read_csv
+        df = read_csv(path)
+        instance = cls()
+        instance.episode = df["episode"].tolist()
+        instance.episode.append(instance.episode[-1] + 1)  # Add one more episode for the next update
+        instance.n_samples = df["n_samples"].tolist()
+        instance.time_replay = df["time_replay"].tolist()
+        return instance
 
 class RL_MPC_agent():
     """
@@ -84,123 +106,19 @@ class RL_MPC_agent():
         self.flags = Flags()
         self.settings = RL_settings(**settings_dict)
 
-        self.exploration_noise = Noise_generator(shape = self.action_shape, noise_type = self.settings.exploration_distribution, noise_std = self.settings.exploration_noise, seed = self.settings.exploration_seed)
-
-        self.V_func_transition_memory = []
         self.Q_func_transition_memory = []
-
-        self.episodes_for_state_value_function = []
         self.episodes_for_action_value_function = []
 
-        self.q_func = self._prepare_q_func()
-
-
-    def _prepare_q_func(self):
-        q_func_input_x = Input(shape = (self.mpc.model._x.shape[0],), name = "q_func_input_x")
-        q_func_input_u_prev = Input(shape=(self.mpc.model._u.shape[0],), name = "q_func_input_u_prev")
-        q_func_input_taken_action = Input(shape=(self.mpc.model._u.shape[0],), name = "q_func_input_taken_action")
-
-        v_func_input = Concatenate(name = "stacked_input_for_v")([q_func_input_x, q_func_input_u_prev])
-        a_func_input = Concatenate(name = "stacked_input_for_a")([q_func_input_x, q_func_input_u_prev, q_func_input_taken_action])
-
-        specific_a_func_input_list = []
-        for idx in range(q_func_input_taken_action.shape[1]):
-            a_func_input_exploration_i = Concatenate(name = f"stacked_input_for_a_{idx}")([q_func_input_x, q_func_input_u_prev, q_func_input_taken_action[:, idx:idx+1]])
-            specific_a_func_input_list.append(a_func_input_exploration_i)
-
-        for idx, neurons in enumerate(self.settings.q_func_architecture):
-            if idx == 0:
-                v_next = Dense(neurons, activation = self.settings.q_func_activation)(v_func_input)
-                a_next_list =[]
-                for a_func_input in specific_a_func_input_list:
-                    a_next = Dense(neurons, activation = self.settings.q_func_activation)(a_func_input)
-                    a_next_list.append(a_next)
-            else:
-                v_next = Dense(neurons, activation = self.settings.q_func_activation)(v_next)
-                for jdx, a_next in enumerate(a_next_list):
-                    a_next = Dense(neurons, activation = self.settings.q_func_activation)(a_next)
-                    a_next_list[jdx] = a_next
-
-        v_func_output = Dense(1, activation = "linear", name = "v_func_output")(v_next)
-        a_next = Concatenate(name = "stacked_a_next_output")(a_next_list)
-        a_func_output = Dense(1, activation = "linear", name = "a_func_output")(a_next)
-
-        output = Concatenate(name = "stacked_output")([v_func_output, a_func_output])
-
-        q_func_model = Q_approximator(inputs = [q_func_input_x, q_func_input_u_prev, q_func_input_taken_action], outputs = output, name ="V_A_func")
-        
-        if self.settings.q_func_optimizer.lower() == "adam":
-            from keras.src.optimizers import Adam as Optimizer
-        else:
-            raise NotImplementedError(f"You try to use {self.settings.q_func_optimizer} as an optimizer, which is not supported yet. Please choose one of the following options: Adam")
-        
-        q_func_model.compile(
-            optimizer = Optimizer(learning_rate=self.settings.q_func_learning_rate),
-            loss = self.settings.q_func_loss,
-            metrics = ["mse"],
-            # run_eagerly= True,
-            )
-        return q_func_model
-
-    def _learn_q_function(
-            self,
-            observed_states,
-            observed_previous_actions,
-            observed_taken_actions,
-            observed_rewards,
-            observed_v_values,
-            observed_next_states,
-            observed_termination,
-            explored_states,
-            explored_previous_actions,
-            explored_taken_actions,
-            explored_rewards,
-            explored_next_states,
-            explored_termination,
-            ):
-        
-        self.observed_states_scaler = MinMaxScaler()
-        self.observed_previous_actions_scaler = MinMaxScaler()
-        self.observed_v_values_scaler = MinMaxScaler()
-
-        scaled_observed_states = self.observed_states_scaler.fit_transform(observed_states)
-        scaled_observed_previous_actions = self.observed_previous_actions_scaler.fit_transform(observed_previous_actions)
-        scaled_observed_v_values = self.observed_v_values_scaler.fit_transform(observed_v_values)
-
-        scaled_explored_rewards = explored_rewards * self.observed_v_values_scaler.scale_
-        scaled_observed_next_states = self.observed_states_scaler.transform(observed_next_states)
-        scaled_observed_taken_actions = self.observed_previous_actions_scaler.transform(observed_taken_actions)
-        scaled_explored_next_states = self.observed_states_scaler.transform(explored_next_states)
-        scaled_explored_taken_actions = self.observed_previous_actions_scaler.transform(explored_taken_actions)
-
-        observed_termination = np.array(observed_termination, dtype = np.float64)
-        explored_termination = np.array(explored_termination, dtype = np.float64)
-
-        V_min = np.ones((scaled_observed_next_states.shape[0], 1)) * self.observed_v_values_scaler.min_
-        x_data = [scaled_observed_states, scaled_observed_previous_actions, scaled_observed_taken_actions, scaled_explored_taken_actions,  scaled_explored_next_states, explored_termination, V_min]
-        y_data = [scaled_observed_v_values, scaled_explored_rewards]
-        self.q_func.fit(
-            x = x_data,
-            y = y_data,
-            batch_size = self.settings.q_func_batch_size,
-            epochs = self.settings.q_func_epochs,
-            verbose = 1,
-            # validation_split = 0.0,
-            callbacks = [
-                ReduceLROnPlateau(monitor = "loss", factor = 0.1, patience = 30, min_lr = 1e-6, min_delta = 1e-7, start_from_epoch = 100),
-                EarlyStopping(monitor = "loss", min_delta = 1e-7, patience = 50, verbose = 1, restore_best_weights = True, start_from_epoch = 100)
-                ],
-        )
-
-        self.q_func.optimizer.learning_rate = self.settings.q_func_learning_rate
-        return
+        self.performance_data = Performance_data()
+    
 
     def _update_parameters(self, update: np.ndarray):
         p_template = self.mpc.get_p_template(1)
         p_template.master = self.mpc.p_fun(0)["_p", 0] + update
 
         self.mpc.set_p_fun(lambda t_now: p_template)
-            
+    
+
     def act(self, state: np.ndarray, old_action: np.ndarray = None, training: bool = False,):
         action = self.mpc.make_step(state, old_action)
 
@@ -209,72 +127,45 @@ class RL_MPC_agent():
         
         raise NotImplementedError("This function can only be used if training = False. The data, required for training changes from method to method and must be implemented in a child class.")
 
-    def explore(self, action):
-        applied_noise = self.exploration_noise()
+    def replay(self):
+        raise NotImplementedError("This is an abstract method. It must be implemented in a child class.")
 
-        proposed_action = action.copy() + applied_noise
-
-        vlb = proposed_action < self.mpc._u_lb.master.full()
-        vub = proposed_action > self.mpc._u_ub.master.full()
-
-        proposed_action[vlb] = action[vlb] - applied_noise[vlb]
-        proposed_action[vub] = action[vub] - applied_noise[vub]
-        return proposed_action
-    
-    def remember_transition_for_V_func(
-            self,
-            state: np.ndarray,
-            previous_action: np.ndarray,
-            taken_action: np.ndarray,
-            jac_action_parameters:np.ndarray,
-            reward: float,
-            next_state: np.ndarray,
-            termination: bool,
-            truncation: bool
-            ):
-        self.V_func_transition_memory.append(
-            (
-                state,
-                previous_action,
-                taken_action,
-                jac_action_parameters,
-                reward,
-                next_state,
-                termination,
-                truncation,
-            )
-        )
-
-    def remember_episode_for_V_func(self):
-        self.episodes_for_state_value_function.append(self.V_func_transition_memory)
-        self.V_func_transition_memory = []
-    
     def remember_transition_for_Q_func(
             self,
             state: np.ndarray,
-            previous_action: np.ndarray,
             taken_action: np.ndarray,
+            jac_action_prev_state:np.ndarray,
+            jac_action_parameters:np.ndarray,
             reward: float,
+            grad_reward_state: np.ndarray,
+            grad_reward_action: np.ndarray,
             next_state: np.ndarray,
+            jac_next_state_previous_state: np.ndarray,
+            jac_next_state_taken_action: np.ndarray,
             termination: bool,
             truncation: bool
             ):
         self.Q_func_transition_memory.append(
             (
                 state,
-                previous_action,
                 taken_action,
+                jac_action_prev_state,
+                jac_action_parameters,
                 reward,
+                grad_reward_state,
+                grad_reward_action,
                 next_state,
+                jac_next_state_previous_state,
+                jac_next_state_taken_action,
                 termination,
                 truncation,
             )
         )
-    
+
     def remember_episode_for_Q_func(self):
         self.episodes_for_action_value_function.append(self.Q_func_transition_memory)
         self.Q_func_transition_memory = []
-        
+            
     def _scale_actions(self):
         self.observed_previous_actions = (self.observed_previous_actions - self.mpc._u_lb.master.T.full()) / self.action_scale
         self.observed_taken_actions = (self.observed_taken_actions - self.mpc._u_lb.master.T.full()) / self.action_scale
@@ -284,35 +175,38 @@ class RL_MPC_agent():
         self.explored_taken_actions = (self.explored_taken_actions - self.mpc._u_lb.master.T.full()) / self.action_scale
         return
 
-    @staticmethod
-    def compute_policy_gradient(jac_action_parameters: np.ndarray, grad_Q_a: np.ndarray):
-        if len(grad_Q_a.shape) == 2:
-            grad_Q_a = np.expand_dims(grad_Q_a, axis = -1)
-        
-        # Compute the policy gradient. For this, we need jac_action_parameters and grad_Q_a at taken action
-        policy_gradient = np.transpose(jac_action_parameters, axes = [0, 2, 1]) @ grad_Q_a
-        policy_gradient = np.mean(policy_gradient, axis = 0)
-
-        return policy_gradient
-
-    @staticmethod
-    def compute_Gauss_Newton_matrix(jac_action_parameters: np.ndarray, hess_Q_a: np.ndarray):
-        # Compute the Gauss-Newton matrix. For this, we need jac_action_parameters and hess_Q_a at taken action
-        Gauss_Newton_matrix = np.transpose(jac_action_parameters, axes = [0, 2, 1]) @ hess_Q_a @ jac_action_parameters
-        Gauss_Newton_matrix = np.mean(Gauss_Newton_matrix, axis = 0)
-        return Gauss_Newton_matrix
+    def _compute_grad_V_theta(self, jac_action_parameters: list[np.ndarray], d_Q_d_a: list[np.ndarray]) -> np.ndarray:
+        """
+        This function computes the gradient of the state-value function with respect to the policy parameters along a full episode.
+        """
+        grad_V_theta = np.zeros((jac_action_parameters[0].T @ d_Q_d_a[0]).shape)
+        for idx, (item_jac_action_params, item_dQ_da) in enumerate(zip(jac_action_parameters, d_Q_d_a)):
+            grad_V_theta += self.settings.gamma ** idx * item_jac_action_params.T @ item_dQ_da
+        return grad_V_theta
     
-    @staticmethod
-    def compute_approximate_Newton_matrix(jac_action_parameters: np.ndarray, jac_jac_action_parameters: np.ndarray, grad_Q_a: np.ndarray, hess_Q_a: np.ndarray):
-        if len(grad_Q_a.shape) == 2:
-            grad_Q_a = np.expand_dims(grad_Q_a, axis = -1)
+    def _compute_hess_V_theta_Gauss_newton(self, jac_action_parameters_per_episode, hess_Q_a_per_episode):
         
-        # Compute the policy gradient. For this, we need jac_action_parameters and grad_a_func at taken action
-        policy_hessian = tensor_vector_product(jac_jac_action_parameters, grad_Q_a)
-        policy_hessian += np.transpose(jac_action_parameters, axes = [0, 2, 1]) @ hess_Q_a @ jac_action_parameters
-        policy_hessian = np.mean(policy_hessian, axis = 0)
-        return policy_hessian
-    
+        H2 = np.zeros((jac_action_parameters_per_episode[0].T @ hess_Q_a_per_episode[0] @ jac_action_parameters_per_episode[0]).shape)
+
+        for idx, (item_jac_action_params, item_hess_Q_a) in enumerate(zip(jac_action_parameters_per_episode, hess_Q_a_per_episode)):
+            H2 += self.settings.gamma ** idx * (item_jac_action_params.T @ item_hess_Q_a @ item_jac_action_params)
+
+        hess_V_theta = H2
+        return hess_V_theta
+
+    def _compute_hess_V_theta_approx_newton(self, jac_action_parameters_per_episode, jac_jac_action_parameters_per_episode, grad_Q_a_per_episode, hess_Q_a_per_episode):
+        
+        H1 = np.zeros((tensor_vector_product(jac_jac_action_parameters_per_episode[0], grad_Q_a_per_episode[0])).shape)
+        H2 = np.zeros((H1.shape))
+
+        for idx, (item_jac_jac_action_params, item_grad_Q_a) in enumerate(zip(jac_jac_action_parameters_per_episode, grad_Q_a_per_episode)):
+            H1 += self.settings.gamma ** idx * tensor_vector_product(item_jac_jac_action_params, item_grad_Q_a)
+
+        for idx, (item_jac_action_params, item_hess_Q_a) in enumerate(zip(jac_action_parameters_per_episode, hess_Q_a_per_episode)):
+            H2 += self.settings.gamma ** idx * (item_jac_action_params.T @ item_hess_Q_a @ item_jac_action_params)
+
+        hess_V_theta = H1 + H2
+        return hess_V_theta
     
     def _regularize_policy_hessian(self, policy_hessian: np.ndarray, jac_action_parameters: np.ndarray):
         if self.settings.regularization.lower() == "fisher":
@@ -322,15 +216,16 @@ class RL_MPC_agent():
             reg_matrix = np.eye(policy_hessian.shape[0])
         elif self.settings.regularization.lower() == "pos_eigen":
             eigenvalues, eigenvectors = np.linalg.eigh(policy_hessian)
-            eigenvalues = -np.abs(eigenvalues) # Ensure eigenvalues are positive
-            eigenvalues = np.clip(eigenvalues, a_max = -1e-3, a_min = None)  # Ensure that the Hessian does not become indefinite.
+            eigenvalues = -np.abs(eigenvalues) # Ensure eigenvalues are negative
+            eigenvalues = np.clip(eigenvalues, a_max = -1e-8, a_min = -1e8)  # Ensure that the Hessian does not become indefinite.
             policy_hessian = eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T
+            reg_matrix = np.eye(policy_hessian.shape[0])
         else:
             raise ValueError(f"The regularization method {self.settings.regularization} is not supported. Please choose one of the following options: Fisher, Identity, pos_eigen")
 
         eigenvalues, eigenvectors = np.linalg.eigh(policy_hessian)
         reg_policy_hessian = policy_hessian.copy()
-        rho = 1e-12
+        rho = 1e-8
         while eigenvalues.max() > 0:
             reg_policy_hessian = policy_hessian  - rho * reg_matrix
             eigenvalues, eigenvectors = np.linalg.eigh(reg_policy_hessian)
@@ -342,13 +237,14 @@ class RL_MPC_agent():
         print(f"Eigenvalues of the policy hessian: {eigenvalues}")
         return policy_hessian
 
+
+
     # Loading and saving utilities! 
     def save(self, path: str, parameters_only: bool = False):
         if not os.path.exists(path):
             os.makedirs(path)
         
         self.save_rl_parameters(path)
-        self.save_q_func(path)
 
         if parameters_only:
             return
@@ -363,8 +259,6 @@ class RL_MPC_agent():
             with open(os.path.join(path, "differentiator.pkl"), "wb") as f:
                 pickle.dump(NLP_differentiator, f)
 
-        q_func = attributes.pop("q_func")
-
         attributes.update({"class": self.__class__})
         
         with open(os.path.join(path, "agent.pkl"), "wb") as f:
@@ -377,11 +271,6 @@ class RL_MPC_agent():
         with open(os.path.join(path, "rl_params.pkl"), "wb") as f:
             pickle.dump(self.mpc.p_fun(0), f)
     
-    def save_q_func(self, path: str):
-        if not os.path.exists(path):
-            os.makedirs(path)
-        self.q_func.save(os.path.join(path, "q_func.keras"))
-    
     def load_rl_parameters(self, path: str):
         with open(os.path.join(path, "rl_params.pkl"), "rb") as f:
             rl_params = pickle.load(f)
@@ -391,9 +280,6 @@ class RL_MPC_agent():
         self.mpc.set_p_fun(lambda t_now: p_template)
         return self.mpc.p_fun(0)
 
-    def load_q_func(self, path: str):
-        self.q_func = load_nn_model(os.path.join(path, "q_func.keras"))
-        return self.q_func
 
     @staticmethod
     def load(path: str, load_differentiator: bool = True):
@@ -407,12 +293,9 @@ class RL_MPC_agent():
         rl_settings = agent_attributes.pop("settings")
 
         agent = cls(mpc, rl_settings.__dict__, init_differentiator = False)
-        # agent.differentiator = differentiator
         if load_differentiator:
             with open(os.path.join(path, "differentiator.pkl"), "rb") as f:
                 agent.differentiator = pickle.load(f)
-
-        agent.load_q_func(path)
         
         for key, value in agent_attributes.items():
             setattr(agent, key, value)
@@ -423,13 +306,11 @@ class RL_MPC_agent():
             os.makedirs(os.path.dirname(path))
 
         memory = {
-            "V_func_transition_memory": self.V_func_transition_memory,
             "Q_func_transition_memory": self.Q_func_transition_memory,
         }
         with open(path, "wb") as f:
             pickle.dump(memory, f)
 
-        self.V_func_transition_memory = []
         self.Q_func_transition_memory = []
         return
         
@@ -442,16 +323,13 @@ class RL_MPC_agent():
 
             with open(os.path.join(path, file), "rb") as f:
                 memory = pickle.load(f)
-            self.V_func_transition_memory = memory["V_func_transition_memory"]
             self.Q_func_transition_memory = memory["Q_func_transition_memory"]
             
-            self.remember_episode_for_V_func()
             self.remember_episode_for_Q_func()
 
             os.remove(os.path.join(path, file))
         
         memory = {
-            "episodes_for_state_value_function": self.episodes_for_state_value_function,
             "episodes_for_action_value_function": self.episodes_for_action_value_function
         }
         with open(os.path.join(path, "memory.pkl"), "wb") as f:
@@ -459,33 +337,30 @@ class RL_MPC_agent():
 
         return 
     
-
-
-
-
 class RL_MPC_GA_agent(RL_MPC_agent):
 
-    def __init__(self, mpc: RL_MPC, settings_dict: dict = {}, init_differentiator: bool = True):
-        super().__init__(mpc, settings_dict)
+    def __init__(self, mpc: RL_MPC, settings_dict: dict = {}, init_differentiator: bool = True, **kwargs):
+        super().__init__(mpc, settings_dict, **kwargs)
 
         if init_differentiator:
-            self.differentiator = NLP_differentiator(self.mpc)
+            self.differentiator_p = NLP_differentiator(self.mpc, ["_p"])
+            self.differentiator_s = NLP_differentiator(self.mpc, ["_x0", "_u_prev"])
             self.flags.differentiator_initialized = True
         else:
             self.differentiator = None
             self.flags.differentiator_initialized = False
 
+        self.update_counter = 0
         if self.settings.use_momentum:
             if self.settings.use_adam:
                 raise ValueError("Momentum and Adam cannot be used together. Please choose one of them.")
             
             self.m = np.zeros((self.mpc.model._p.shape[0], 1))
-            self.update_counter = 0
 
         elif self.settings.use_adam:
             self.m = np.zeros((self.mpc.model._p.shape[0], 1))
             self.v = np.zeros((self.mpc.model._p.shape[0], 1))
-            self.update_counter = 0
+            
 
     def act(self, state: np.ndarray, old_action: np.ndarray = None, training: bool = False):
         action = self.mpc.make_step(state, old_action)
@@ -499,220 +374,176 @@ class RL_MPC_GA_agent(RL_MPC_agent):
             print("\nThe solver did not converge. The action is not used for training.")
         
         if self.mpc.solver_stats["success"]:
-            jac_action_parameters = self.differentiator.jac_action_parameters(self.mpc)
+            jac_action_parameters = self.differentiator_p.jac_action_parameters(self.mpc)
+            jac_action_state = self.differentiator_s.jac_action_parameters(self.mpc)
         else:
             jac_action_parameters = cd.DM.zeros((self.mpc.model._u.shape[0], self.mpc.model._p.shape[0]))
+            jac_action_state = cd.DM.zeros((self.mpc.model._u.shape[0], self.mpc.model._x.shape[0] + self.mpc.model._u.shape[0]))
 
         action_dict = {
             "action": action,
             "jac_action_parameters": jac_action_parameters,
+            "jac_action_state": jac_action_state,
             "success": self.mpc.solver_stats["success"],
         }
 
         return action_dict
     
+    def _compute_observed_clc(self):
+        observed_clc = []
+
+        for episode_idx, episode in enumerate(self.episodes_for_action_value_function):
+            episode_clc = 0.0
+            for trans_idx, transition in enumerate(reversed(episode)): 
+                reward = transition[4]
+                episode_clc = reward + self.settings.gamma * episode_clc
+            
+            observed_clc.append(episode_clc)
+        
+        observed_clc = np.stack(observed_clc).mean()
+
+        return observed_clc
+    
     def _prepare_calculations(self):
 
-        ### First do everything for the state value function
-        observed_states = []
-        observed_previous_actions = []
+        ### Collect everything for gradient of the action-value function
+        states = []
 
-        observed_taken_action = []
-        observed_jac_taken_action_parameters = []
+        taken_actions = []
+        jacs_taken_action_parameters = []
+        jacs_taken_action_state = []
 
-        observed_rewards = []
+        rewards = []
+        grads_rewards_state = []
+        grads_rewards_action = []
+        d_reward_d_state = []
 
-        observed_next_state = []
+        next_states = []
+        d_next_state_d_state = []
+        d_next_state_d_action = []
 
-        observed_v_values = []
+        terminations = []
+        truncations = []
 
-        observed_termination = []
-        observed_truncation = []
+        d_Q_d_a_list = []
+        d_Q_d_s_list = []
 
-        for episode in self.episodes_for_state_value_function:
-            for idx, (state, previous_action, taken_action, jac_action_parameters, reward, next_state, termination, truncation) in enumerate(reversed(episode)):
-                
-                if idx == 0:
-                    v_value = reward
-                else:
-                    v_value = reward + self.settings.gamma * v_value
+        grad_V_theta_episode_list = []
 
-                observed_states.append(state)
-                observed_previous_actions.append(previous_action)
-
-                observed_taken_action.append(taken_action)
-                observed_jac_taken_action_parameters.append(jac_action_parameters)
-
-                observed_rewards.append(reward)
-
-                observed_next_state.append(next_state)
-
-                observed_v_values.append(v_value)
-
-                observed_termination.append(termination)
-                observed_truncation.append(truncation)
-            pass
-
-        self.observed_states = np.hstack(observed_states).T
-        self.observed_previous_actions = np.hstack(observed_previous_actions).T
-
-        self.observed_taken_actions = np.hstack(observed_taken_action).T
-        self.observed_jac_taken_action_parameters = np.stack(observed_jac_taken_action_parameters)
-
-        self.observed_rewards = np.array(observed_rewards).reshape(-1, 1)
-
-        self.observed_next_state = np.hstack(observed_next_state).T
-
-        self.observed_v_values = np.array(observed_v_values).reshape(-1, 1)
-
-        self.observed_termination = np.array(observed_termination).reshape(-1, 1)
-        self.observed_truncation = np.array(observed_truncation).reshape(-1, 1)
-
-
-
-        ### Now do everything for the action value function
-        explored_states = []
-        explored_previous_actions = []
-
-        explored_taken_actions = []
-
-        explored_rewards = []
-
-        explored_next_states = []
-
-        explored_termination = []
-        explored_truncation = []
 
         for episode in self.episodes_for_action_value_function:
-            for idx, (state, previous_action, taken_action, reward, next_state, termination, truncation) in enumerate(reversed(episode)):
-                explored_states.append(state)
-                explored_previous_actions.append(previous_action)
+            jac_action_parameters_per_episode = []
+            grad_Q_a_per_episode = []
+        
 
-                explored_taken_actions.append(taken_action)
+            for idx, (state, taken_action, jac_action_prev_state, jac_action_parameters, reward, grad_reward_state, grad_reward_action, next_state, jac_next_state_previous_state, jac_next_state_taken_action, termination, truncation) in enumerate(reversed(episode)):              
+                states.append(state)
 
-                explored_rewards.append(reward)
+                taken_actions.append(taken_action)
+                jacs_taken_action_parameters.append(jac_action_parameters)
+                jacs_taken_action_state.append(jac_action_prev_state)
 
-                explored_next_states.append(next_state)
+                rewards.append(reward)
+                grads_rewards_state.append(grad_reward_state)
+                grads_rewards_action.append(grad_reward_action)
 
-                explored_termination.append(termination)
-                explored_truncation.append(truncation)
+                next_states.append(next_state)
+                d_next_state_d_state.append(jac_next_state_previous_state)
+                d_next_state_d_action.append(jac_next_state_taken_action)
 
-        self.explored_states = np.hstack(explored_states).T
-        self.explored_previous_actions = np.hstack(explored_previous_actions).T
+                terminations.append(termination)
+                truncations.append(truncation)
 
-        self.explored_taken_actions = np.hstack(explored_taken_actions).T
+                d_r_d_s = grad_reward_state + jac_action_prev_state.T @ grad_reward_action
+                d_s_next_d_s = jac_next_state_previous_state + jac_next_state_taken_action @ jac_action_prev_state
+                if idx == 0:
+                    d_Q_d_a = grad_reward_action.copy()
+                    d_Q_d_s = d_r_d_s.copy()      
+                else:
+                    d_Q_d_a = grad_reward_action + self.settings.gamma * jac_next_state_taken_action.T @ d_Q_d_s
+                    d_Q_d_s = d_r_d_s + self.settings.gamma * d_s_next_d_s.T @ d_Q_d_s
 
-        self.explored_rewards = np.array(explored_rewards).reshape(-1, 1)
+                d_Q_d_a_list.append(d_Q_d_a)
+                d_Q_d_s_list.append(d_Q_d_s)
 
-        self.explored_next_states = np.hstack(explored_next_states).T
+                jac_action_parameters_per_episode.append(jac_action_parameters)
+                grad_Q_a_per_episode.append(d_Q_d_a)
 
-        self.explored_termination = np.array(explored_termination).reshape(-1, 1)
-        self.explored_truncation = np.array(explored_truncation).reshape(-1, 1)
+            # Compute the gradient of the state-value function for this episode
+            jac_action_parameters_per_episode.reverse()
+            grad_Q_a_per_episode.reverse()
+            grad_V_theta = self._compute_grad_V_theta(jac_action_parameters_per_episode, grad_Q_a_per_episode)
+            grad_V_theta_episode_list.append(grad_V_theta)
 
-        return
+        self.observed_states = np.hstack(states).T
+
+        self.observed_taken_actions = np.hstack(taken_actions).T
+        self.observed_jac_taken_action_parameters = np.stack(jacs_taken_action_parameters)
+        self.observed_jac_taken_action_state = np.stack(jacs_taken_action_state)
+
+        self.observed_rewards = np.array(rewards).reshape(-1, 1)
+        self.observed_grad_rewards_state = np.stack(grads_rewards_state)
+        self.observed_grad_rewards_action = np.stack(grads_rewards_action)
+
+        self.observed_next_states = np.hstack(next_states).T
+        self.observed_d_next_state_d_state = np.stack(d_next_state_d_state).T
+        self.observed_d_next_state_d_action = np.stack(d_next_state_d_action).T
+
+        self.observed_termination = np.array(terminations).reshape(-1, 1)
+        self.observed_truncation = np.array(truncations).reshape(-1, 1)
+
+        self.grad_Q_a = np.hstack(d_Q_d_a_list).T
+        self.grad_Q_s = np.hstack(d_Q_d_s_list).T
+
+        self.grad_V_theta = np.stack(grad_V_theta_episode_list)
+
+        policy_gradient = self.grad_V_theta.mean(axis = 0)
+
+        return policy_gradient
     
+    @staticmethod
+    def _compute_predicted_clc(local_clc: float, m_hat: np.ndarray, update: np.ndarray):
+        predicted_clc = local_clc + m_hat.T @ update
+        predicted_clc = predicted_clc[0, 0]
+        return predicted_clc
+
     def replay(self):
-        
-        self._prepare_calculations()
+        start_time_replay = time.time()
 
-        if self.settings.use_scaled_actions:
-            self._scale_actions()
-
-        if self.settings.q_func_always_reset:
-            # Reset the q_func model
-            self.q_func = self._prepare_q_func()
-
+        observed_clc = self._compute_observed_clc()
+        print(f"Observed CLC: {observed_clc:.4f}")
         
-        self._learn_q_function(
-            self.observed_states,
-            self.observed_previous_actions,
-            self.observed_taken_actions,
-            self.observed_rewards,
-            self.observed_v_values,
-            self.observed_next_state,
-            self.observed_termination,
-            self.explored_states,
-            self.explored_previous_actions,
-            self.explored_taken_actions,
-            self.explored_rewards,
-            self.explored_next_states,
-            self.explored_termination,
-            )
+        policy_gradient = self._prepare_calculations()
 
-        # Get everything for the policy gradient
-        a_values, grad_Q_a = self._get_Q_gradient(self.observed_states, self.observed_previous_actions, self.observed_taken_actions)
+        print(f"Policy gradient:")
+        print(policy_gradient)
         
-        if self.settings.clip_jac_policy:
-            where_at_upper_bound = np.where(np.isclose(self.observed_taken_actions - self.mpc._u_ub.master.T.full(), 0, atol = 1e-6))
-            self.observed_jac_taken_action_parameters[where_at_upper_bound] = np.clip(self.observed_jac_taken_action_parameters[where_at_upper_bound], a_max = 0, a_min = None)
+        update, m_hat, v_hat = self._compute_update(policy_gradient)
 
-            where_at_lower_bound = np.where(np.isclose(self.observed_taken_actions - self.mpc._u_lb.master.T.full(), 0, atol = 1e-6))
-            self.observed_jac_taken_action_parameters[where_at_lower_bound] = np.clip(self.observed_jac_taken_action_parameters[where_at_lower_bound], a_min = 0, a_max = None)
-        
-        policy_gradient = self.compute_policy_gradient(self.observed_jac_taken_action_parameters, grad_Q_a)
-        print(f"Policy gradient: {policy_gradient}")
-        
-        update = self._compute_update(policy_gradient)
+        print(f"Parameter update:")
+        print(update)
+
+        predicted_clc = RL_MPC_GA_agent._compute_predicted_clc(observed_clc, m_hat, update)
+        print(f"Predicted CLC after update: {predicted_clc:.4f}")
 
         self._update_parameters(update)
 
         self.episodes_for_action_value_function = []
-        self.episodes_for_state_value_function = []
+
+        end_time_replay = time.time()
+        self._time_replay = end_time_replay - start_time_replay
+
+        # Track performance metrics
+        self.performance_data.update(self)
 
         return policy_gradient
     
-    def _get_Q_gradient(self, observed_states: np.ndarray, observed_previous_actions: np.ndarray, observed_taken_actions: np.ndarray):
-
-        scaled_states = self.observed_states_scaler.transform(observed_states)
-        scaled_previous_actions = self.observed_previous_actions_scaler.transform(observed_previous_actions)
-        exploration = np.zeros(observed_previous_actions.shape)
-
-        scaled_states = constant(scaled_states, dtype = np.float64)
-        scaled_previous_actions = constant(scaled_previous_actions, dtype = np.float64)
-        observed_taken_actions = constant(observed_taken_actions, dtype = np.float64)
-        exploration = constant(exploration, dtype = np.float64)
-
-        action_min = constant(self.observed_previous_actions_scaler.min_, dtype = np.float64)
-        action_scale = constant(self.observed_previous_actions_scaler.scale_, dtype = np.float64)
-        v_func_min = constant(self.observed_v_values_scaler.min_, dtype = np.float64)
-        v_func_scale = constant(self.observed_v_values_scaler.scale_, dtype = np.float64)
-
-        # Compute the gradient of the action-value function
-        with GradientTape(persistent=False) as tape:
-            tape.watch(observed_taken_actions)
-
-            scaled_observed_taken_actions = action_scale * observed_taken_actions + action_min
-
-            scaled_v_a_values = self.q_func([scaled_states, scaled_previous_actions, scaled_observed_taken_actions], training = False)
-
-            scaled_v_values = scaled_v_a_values[:, 0:1]  # Get the state value function output
-            scaled_a_values = scaled_v_a_values[:, 1:2]  # Get the action value function output
-
-            v_values = (scaled_v_values - v_func_min) / v_func_scale
-            a_values = scaled_a_values / v_func_scale 
-
-
-        grad_Q_a = tape.gradient(a_values, observed_taken_actions) # This is the same as the Q-function gradient because V is not a function of a
-        
-        v_values = v_values.numpy()
-        grad_Q_a = grad_Q_a.numpy()
-
-        if self.settings.clip_q_gradients:
-            where_at_upper_bound = np.where(np.isclose(observed_taken_actions - self.mpc._u_ub.master.T.full(), 0, atol = 1e-6))
-            grad_Q_a[where_at_upper_bound] = np.clip(grad_Q_a[where_at_upper_bound], a_max = 0, a_min = None)
-
-            where_at_lower_bound = np.where(np.isclose(observed_taken_actions - self.mpc._u_lb.master.T.full(), 0, atol = 1e-6))
-            grad_Q_a[where_at_lower_bound] = np.clip(grad_Q_a[where_at_lower_bound], a_min = 0, a_max = None)
-
-        return v_values, grad_Q_a
-
     def _compute_update(self, policy_gradient: np.ndarray):
         """
         This function is used to compute the update for the parameters.
         """
+        self.update_counter += 1
         if self.settings.use_momentum:
-            self.update_counter += 1
-
             # Update biased first moment estimate
             self.m = self.settings.adam_beta_1 * self.m + (1 - self.settings.adam_beta_1) * policy_gradient
 
@@ -721,9 +552,9 @@ class RL_MPC_GA_agent(RL_MPC_agent):
 
             update = m_hat * self.settings.actor_learning_rate
 
-        elif self.settings.use_adam:
-            self.update_counter += 1
+            v_hat = None
 
+        elif self.settings.use_adam:
             # Update biased first moment estimate
             self.m = self.settings.adam_beta_1 * self.m + (1 - self.settings.adam_beta_1) * policy_gradient
 
@@ -742,162 +573,382 @@ class RL_MPC_GA_agent(RL_MPC_agent):
         else:
             # If not using Adam or momentum, just use the policy gradient
             update = self.settings.actor_learning_rate * policy_gradient
+            m_hat = policy_gradient
+            v_hat = None
 
-        return update
-
-
-
+        return update, m_hat, v_hat
 
 class RL_MPC_GN_agent(RL_MPC_GA_agent):
 
-    def __init__(self, mpc: RL_MPC, settings_dict: dict = {}, init_differentiator: bool = True):
-        super().__init__(mpc, settings_dict, init_differentiator)
+    def __init__(self, mpc: RL_MPC, settings_dict: dict = {}, init_differentiator: bool = True, **kwargs):
+        super().__init__(mpc, settings_dict, init_differentiator = False, **kwargs)
+        
+        if init_differentiator:
+            self.differentiator_p = NLP_differentiator(self.mpc, ["_p"], second_order = False,)
+            self.differentiator_s = NLP_differentiator(self.mpc, ["_x0", "_u_prev"], second_order = True,)
+            self.flags.differentiator_initialized = True
 
         # Initialize the GN estimate
         if self.settings.use_momentum:
-            self.D_init = -np.eye(self.mpc.model._p.shape[0]) * self.settings.omegainv
-            self.D = self.D_init.copy()
+            self.D = np.zeros((self.mpc.model._p.shape[0], self.mpc.model._p.shape[0]))
+            self.v = np.zeros((self.mpc.model._p.shape[0], 1))
 
         elif self.settings.use_adam:
             raise ValueError("You try to use Adam for second order optimization. Adam already scaled the first order update so the gradient is theoretically already corrected.")
-            
+    
+    def act(self, state: np.ndarray, old_action: np.ndarray,  training: bool = False):
+        action = self.mpc.make_step(state, old_action)
 
-    def replay(self):
-        self._prepare_calculations()
-
-        if self.settings.use_scaled_actions:
-            self._scale_actions()
-
-        if self.settings.q_func_always_reset:
-            # Reset the q_func model
-            self.q_func = self._prepare_q_func()
-
+        if not training:
+            return action
         
-        self._learn_q_function(
-            self.observed_states,
-            self.observed_previous_actions,
-            self.observed_taken_actions,
-            self.observed_rewards,
-            self.observed_v_values,
-            self.observed_next_state,
-            self.observed_termination,
-            self.explored_states,
-            self.explored_previous_actions,
-            self.explored_taken_actions,
-            self.explored_rewards,
-            self.explored_next_states,
-            self.explored_termination,
+        if not self.flags.differentiator_initialized:
+            raise ValueError("The differentiator must be initialized before training.")
+        if not self.mpc.solver_stats["success"]:
+            print("\nThe solver did not converge. The action is not used for training.")
+        
+        if self.mpc.solver_stats["success"]:
+            jac_action_parameters = self.differentiator_p.jac_action_parameters(self.mpc)
+            jac_action_state, jac_jac_action_state = self.differentiator_s.jac_jac_action_parameters_parameters(self.mpc)
+        else:
+            jac_action_parameters = np.zeros((self.differentiator_p.n_u, self.differentiator_p.n_p))
+            jac_action_state = np.zeros((self.differentiator_s.n_u, self.differentiator_s.n_p))
+            jac_jac_action_state = np.zeros((self.differentiator_s.n_u, self.differentiator_s.n_p, self.differentiator_s.n_p))
+
+        action_dict = {
+            "action": action,
+            "jac_action_parameters": jac_action_parameters,
+            "jac_action_state": jac_action_state,
+            "jac_jac_action_states": jac_jac_action_state,
+            "success": self.mpc.solver_stats["success"],
+        }
+
+        return action_dict
+    
+    def remember_transition_for_Q_func(
+            self,
+            state: np.ndarray,
+            taken_action: np.ndarray,
+            jac_action_prev_state:np.ndarray,
+            jac_action_parameters:np.ndarray,
+            jac_jac_action_state:np.ndarray,
+            reward: float,
+            grad_reward_state: np.ndarray,
+            grad_reward_action: np.ndarray,
+            hess_reward_state: np.ndarray,
+            hess_reward_action: np.ndarray,
+            jac_jac_reward_state_action: np.ndarray,
+            next_state: np.ndarray,
+            jac_next_state_previous_state: np.ndarray,
+            jac_next_state_taken_action: np.ndarray,
+            jac_jac_next_state_previous_state: np.ndarray,
+            jac_jac_next_state_taken_action: np.ndarray,
+            jac_jac_next_state_state_action: np.ndarray,
+            termination: bool,
+            truncation: bool
+            ):
+        self.Q_func_transition_memory.append(
+            (
+                state,
+                taken_action,
+                jac_action_prev_state,
+                jac_action_parameters,
+                jac_jac_action_state,
+                reward,
+                grad_reward_state,
+                grad_reward_action,
+                hess_reward_state,
+                hess_reward_action,
+                jac_jac_reward_state_action,
+                next_state,
+                jac_next_state_previous_state,
+                jac_next_state_taken_action,
+                jac_jac_next_state_previous_state,
+                jac_jac_next_state_taken_action,
+                jac_jac_next_state_state_action,
+                termination,
+                truncation,
             )
+        )
+
+    def _prepare_calculations(self):
+
+        ### Collect everything for gradient of the action-value function
+        states = []
+
+        taken_actions = []
+        jacs_taken_action_parameters = []
+        jacs_taken_action_state = []
+
+        rewards = []
+        grads_rewards_state = []
+        grads_rewards_action = []
+        d_reward_d_state = []
+
+        next_states = []
+        d_next_state_d_state = []
+        d_next_state_d_action = []
+
+        terminations = []
+        truncations = []
+
+        d_Q_d_a_list = []
+        d_Q_d_s_list = []
+
+        d2_Q_d_a2_list = []
+        d2_Q_d_s2_list = []
+
+        grad_V_theta_episode_list = []
+        hess_V_theta_episode_list = []
 
 
-        # Get everything for the policy gradient
-        a_values, grad_Q_a, hess_Q_a = self._get_Q_hessian(self.observed_states, self.observed_previous_actions, self.observed_taken_actions)
+
+
+        for episode in self.episodes_for_action_value_function:
+            jac_action_parameters_per_episode = []
+            grad_Q_a_per_episode = []
+            hess_Q_a_per_episode = []
+
+            for idx, (state, taken_action, jac_action_prev_state, jac_action_parameters, jac_jac_action_state, reward, grad_reward_state, grad_reward_action, hess_reward_state, hess_reward_action, jac_jac_reward_state_action, next_state, jac_next_state_previous_state, jac_next_state_taken_action, jac_jac_next_state_previous_state, jac_jac_next_state_taken_action, jac_jac_next_state_state_action, termination, truncation) in enumerate(reversed(episode)):              
+                states.append(state)
+
+                taken_actions.append(taken_action)
+                jacs_taken_action_parameters.append(jac_action_parameters)
+                jacs_taken_action_state.append(jac_action_prev_state)
+
+                rewards.append(reward)
+                grads_rewards_state.append(grad_reward_state)
+                grads_rewards_action.append(grad_reward_action)
+
+                next_states.append(next_state)
+                d_next_state_d_state.append(jac_next_state_previous_state)
+                d_next_state_d_action.append(jac_next_state_taken_action)
+
+                terminations.append(termination)
+                truncations.append(truncation)
+
+                d_r_d_s = grad_reward_state + jac_action_prev_state.T @ grad_reward_action
+                d_s_next_d_s = jac_next_state_previous_state + jac_next_state_taken_action @ jac_action_prev_state
+
+                d2_r_d_s2 = hess_reward_state + jac_action_prev_state.T @ hess_reward_action @ jac_action_prev_state
+                d2_r_d_s2 += jac_jac_reward_state_action @ jac_action_prev_state +(jac_jac_reward_state_action @ jac_action_prev_state).T
+                d2_r_d_s2 += tensor_vector_product(jac_jac_action_state, grad_reward_action)
+
+                d2_s_next_d_s2 = jac_jac_next_state_previous_state + matrix_tensor_matrix_product(jac_action_prev_state.T, jac_jac_next_state_taken_action, jac_action_prev_state)
+                d2_s_next_d_s2 += tensor_matrix_product(jac_jac_action_state, jac_next_state_taken_action)
+                d2_s_next_d_s2 += matrix_tensor_matrix_product(np.eye(jac_jac_next_state_state_action.shape[1]), jac_jac_next_state_state_action, jac_action_prev_state)
+                d2_s_next_d_s2 += matrix_tensor_matrix_product(jac_action_prev_state.T, np.transpose(jac_jac_next_state_state_action, axes = [0, 2, 1]), np.eye(np.transpose(jac_jac_next_state_state_action, axes = [0, 2, 1]).shape[2]))
+
+                if idx == 0:
+                    d_Q_d_a = grad_reward_action.copy()
+                    d2_Q_d_a2 = hess_reward_action.copy()
+
+                    d_Q_d_s = d_r_d_s.copy()   
+                    d2_Q_d_s2 = d2_r_d_s2.copy()   
+                    
+                    v_value = reward
+
+                else:
+                    d_Q_d_a = grad_reward_action + self.settings.gamma * jac_next_state_taken_action.T @ d_Q_d_s
+
+                    d2_Q_d_a2 = hess_reward_action.copy()
+                    d2_Q_d_a2 += self.settings.gamma * (jac_next_state_taken_action.T @ d2_Q_d_s2 @ jac_next_state_taken_action)
+                    d2_Q_d_a2 += self.settings.gamma * tensor_vector_product(jac_jac_next_state_taken_action, d_Q_d_s)
+
+                    d2_Q_d_s2 = d2_r_d_s2.copy() + self.settings.gamma * (d_s_next_d_s.T @ d2_Q_d_s2 @ d_s_next_d_s)
+                    d2_Q_d_s2 += self.settings.gamma * tensor_vector_product(d2_s_next_d_s2, d_Q_d_s)
+
+                    d_Q_d_s = d_r_d_s + self.settings.gamma * d_s_next_d_s.T @ d_Q_d_s
+
+                    v_value = reward + self.settings.gamma * v_value
+
+                d_Q_d_a_list.append(d_Q_d_a)
+                d_Q_d_s_list.append(d_Q_d_s)
+
+                d2_Q_d_a2_list.append(d2_Q_d_a2)
+                d2_Q_d_s2_list.append(d2_Q_d_s2)
+
+                jac_action_parameters_per_episode.append(jac_action_parameters)
+                grad_Q_a_per_episode.append(d_Q_d_a)
+                hess_Q_a_per_episode.append(d2_Q_d_a2)
+
+
+            # Compute the gradient and hessian of the state-value function for this episode
+            jac_action_parameters_per_episode.reverse()
+            grad_Q_a_per_episode.reverse()
+            hess_Q_a_per_episode.reverse()
+            grad_V_theta = self._compute_grad_V_theta(jac_action_parameters_per_episode, grad_Q_a_per_episode)
+            hess_V_theta = self._compute_hess_V_theta_Gauss_newton(jac_action_parameters_per_episode, hess_Q_a_per_episode)
+            grad_V_theta_episode_list.append(grad_V_theta)
+            hess_V_theta_episode_list.append(hess_V_theta)
+
+        self.observed_states = np.hstack(states).T
+
+        self.observed_taken_actions = np.hstack(taken_actions).T
+        self.observed_jac_taken_action_parameters = np.stack(jacs_taken_action_parameters)
+        self.observed_jac_taken_action_state = np.stack(jacs_taken_action_state)
+
+        self.observed_rewards = np.array(rewards).reshape(-1, 1)
+        self.observed_grad_rewards_state = np.stack(grads_rewards_state)
+        self.observed_grad_rewards_action = np.stack(grads_rewards_action)
+
+        self.observed_next_states = np.hstack(next_states).T
+        self.observed_d_next_state_d_state = np.stack(d_next_state_d_state).T
+        self.observed_d_next_state_d_action = np.stack(d_next_state_d_action).T
+
+        self.observed_termination = np.array(terminations).reshape(-1, 1)
+        self.observed_truncation = np.array(truncations).reshape(-1, 1)
+
+        self.grad_Q_a = np.hstack(d_Q_d_a_list).T
+        self.grad_Q_s = np.hstack(d_Q_d_s_list).T
+
+        self.hess_Q_a = np.stack(d2_Q_d_a2_list)
+        self.hess_Q_s = np.stack(d2_Q_d_s2_list)
+
+        self.grad_V_theta = np.stack(grad_V_theta_episode_list)
+        self.hess_V_theta = np.stack(hess_V_theta_episode_list)
+
+        policy_gradient = self.grad_V_theta.mean(axis = 0)
+        policy_hessian = self.hess_V_theta.mean(axis = 0)
+
+        return policy_gradient, policy_hessian
+
+    def _compute_observed_clc(self):
+        observed_clc = []
+
+        for episode_idx, episode in enumerate(self.episodes_for_action_value_function):
+            episode_clc = 0.0
+            for trans_idx, transition in enumerate(reversed(episode)): 
+                reward = transition[5]
+                episode_clc = reward + self.settings.gamma * episode_clc
+            
+            observed_clc.append(episode_clc)
         
-        if self.settings.clip_jac_policy:
-            where_at_upper_bound = np.where(np.isclose(self.observed_taken_actions - self.mpc._u_ub.master.T.full(), 0, atol = 1e-6))
-            self.observed_jac_taken_action_parameters[where_at_upper_bound] = np.clip(self.observed_jac_taken_action_parameters[where_at_upper_bound], a_max = 0, a_min = None)
+        observed_clc = np.stack(observed_clc).mean()
 
-            where_at_lower_bound = np.where(np.isclose(self.observed_taken_actions - self.mpc._u_lb.master.T.full(), 0, atol = 1e-6))
-            self.observed_jac_taken_action_parameters[where_at_lower_bound] = np.clip(self.observed_jac_taken_action_parameters[where_at_lower_bound], a_min = 0, a_max = None)
-        
-        policy_gradient = self.compute_policy_gradient(self.observed_jac_taken_action_parameters, grad_Q_a)
-        policy_hessian = self.compute_Gauss_Newton_matrix(self.observed_jac_taken_action_parameters, hess_Q_a)
+        return observed_clc
+    
+    @staticmethod
+    def _compute_predicted_clc(local_clc: float, policy_gradient: np.ndarray, policy_hessian: np.ndarray, update: np.ndarray):
+        predicted_clc = local_clc + policy_gradient.T @ update + 0.5 * update.T @ policy_hessian @ update
+        predicted_clc = predicted_clc[0, 0]
+        return predicted_clc
+    
+    def replay(self):
+        start_time_replay = time.time()
 
+        observed_clc = self._compute_observed_clc()
+        print(f"Observed CLC: {observed_clc:.4f}")
+
+        policy_gradient, policy_hessian = self._prepare_calculations()
         policy_hessian = self._regularize_policy_hessian(policy_hessian, self.observed_jac_taken_action_parameters)
-        print(f"Policy gradient: {policy_gradient}")
-        print(f"Policy hessian: {policy_hessian}")
 
-        update = self._compute_update(policy_gradient, policy_hessian)
+        print(f"Policy gradient:")
+        print(policy_gradient)
+        print(f"Policy hessian:")
+        print(policy_hessian)
+
+        update, m_hat, D_hat = self._compute_update(policy_gradient, policy_hessian)
+
+        print(f"Parameter update:")
+        print(update)
+
+        predicted_clc = RL_MPC_GN_agent._compute_predicted_clc(observed_clc, m_hat, D_hat, update)
+        print(f"Predicted CLC after update: {predicted_clc:.4f}")
+
 
         self._update_parameters(update)
 
         self.episodes_for_action_value_function = []
-        self.episodes_for_state_value_function = []
+
+        end_time_replay = time.time()
+        self._time_replay = end_time_replay - start_time_replay
+
+        # Track performance metrics
+        self.performance_data.update(self)
 
         return policy_gradient, policy_hessian
 
-    def _get_Q_hessian(self, observed_states: np.ndarray, observed_previous_actions: np.ndarray, observed_taken_actions: np.ndarray):
-
-        scaled_states = self.observed_states_scaler.transform(observed_states)
-        scaled_previous_actions = self.observed_previous_actions_scaler.transform(observed_previous_actions)
-        observed_taken_actions_tf = constant(observed_taken_actions, dtype = np.float64)
-        exploration = np.zeros(observed_previous_actions.shape)
-
-        scaled_states = constant(scaled_states, dtype = np.float64)
-        scaled_previous_actions = constant(scaled_previous_actions, dtype = np.float64)
-        exploration = constant(exploration, dtype = np.float64)
-
-        action_min = constant(self.observed_previous_actions_scaler.min_, dtype = np.float64)
-        action_scale = constant(self.observed_previous_actions_scaler.scale_, dtype = np.float64)
-        v_func_scale = constant(self.observed_v_values_scaler.scale_, dtype = np.float64)
-
-        # Compute the gradient of the advantage function
-        with GradientTape(persistent=False) as tape_hessian:
-            tape_hessian.watch(observed_taken_actions_tf)
-            with GradientTape(persistent=False) as tape_gradient:
-                tape_gradient.watch(observed_taken_actions_tf)
-
-                scaled_observed_taken_actions_tf = action_scale * observed_taken_actions_tf + action_min 
-
-                scaled_v_values = self.q_func([scaled_states, scaled_previous_actions, scaled_observed_taken_actions_tf], training = False)
-
-                advantages = scaled_v_values[:, 1:2] / v_func_scale
-
-            grad_Q_a = tape_gradient.batch_jacobian(advantages, observed_taken_actions_tf)
-    
-        hess_Q_a = tape_hessian.batch_jacobian(grad_Q_a, observed_taken_actions_tf)
-
-        advantages = advantages.numpy()
-        grad_Q_a = grad_Q_a.numpy()[:, 0, :]
-        hess_Q_a = hess_Q_a.numpy()[:, 0, :, :]
-
-        if self.settings.clip_q_gradients:
-            where_at_upper_bound = np.where(np.isclose(observed_taken_actions - self.mpc._u_ub.master.T.full(), 0, atol = 1e-6))
-            grad_Q_a[where_at_upper_bound] = np.clip(grad_Q_a[where_at_upper_bound], a_max = 0, a_min = None)
-
-            where_at_lower_bound = np.where(np.isclose(observed_taken_actions - self.mpc._u_lb.master.T.full(), 0, atol = 1e-6))
-            grad_Q_a[where_at_lower_bound] = np.clip(grad_Q_a[where_at_lower_bound], a_min = 0, a_max = None)
-
-        return advantages, grad_Q_a, hess_Q_a
-
     def _compute_update(self, policy_gradient: np.ndarray, policy_hessian: np.ndarray):
+        self.update_counter += 1
+
+        m_hat = policy_gradient.copy()
+        v_hat = policy_gradient.copy() ** 2 
+        D_hat = policy_hessian.copy()
 
         if self.settings.use_momentum:
-            self.update_counter += 1
-            
-            # Correct the policy gradient
             self.m = self.settings.momentum_beta * self.m + (1 - self.settings.momentum_beta) * policy_gradient
             m_hat = self.m / (1 - self.settings.momentum_beta ** self.update_counter)
+            where_numerically_zero = np.where(np.abs(m_hat) < self.settings.adam_epsilon)
+            m_hat[where_numerically_zero] = 0.0
 
-            corrected_policy_gradient = m_hat
+            self.v = self.settings.momentum_beta_2 * self.v + (1 - self.settings.momentum_beta_2) * (policy_gradient ** 2)
+            v_hat = self.v / (1 - self.settings.momentum_beta_2 ** self.update_counter)
 
-            # Correct the policy hessian
+            if self.update_counter == 1:
+                D_init = -np.diag(np.sqrt(v_hat).flatten())
+                self.D = D_init.copy()
+
             self.D = self.settings.momentum_eta * self.D + (1 - self.settings.momentum_eta) * policy_hessian
-                     
-            # Bias corrected policy Hessian
             D_hat = self.D / (1 - self.settings.momentum_eta ** (self.update_counter + 1))
 
-            update = np.linalg.solve(D_hat, - corrected_policy_gradient)
-            update *= self.settings.actor_learning_rate
 
-        elif self.settings.use_adam:
-            raise ValueError("You cannot use Adam with the Gauss-Newton approach.")
-        
+
+        update = np.linalg.solve(D_hat, - m_hat)
+        update_norm = np.sqrt(update.T @ update)
+
+        tr_radius = self.settings.trust_region_radius
+        if self.settings.scale_tr_radius_to_dimension and not self.settings.adaptive_trust_region:
+            tr_radius *= np.sqrt(policy_gradient.shape[0])
+        elif self.settings.adaptive_trust_region and not self.settings.scale_tr_radius_to_dimension:
+            adam_update = self.settings.actor_learning_rate * (m_hat / (np.sqrt(v_hat) + self.settings.adam_epsilon))
+            tr_radius = np.sqrt(adam_update.T @ adam_update).flatten()[0]
         else:
-            update = np.linalg.solve(policy_hessian, - policy_gradient)
-            update *= self.settings.actor_learning_rate
-        return update
+            print("Warning: Both adaptive_trust_region and scale_tr_radius_to_dimension are set to True. Only one of these options should be enabled. Proceeding with adaptive_trust_region.")
+        
+        if update_norm > tr_radius:
+
+            print(f"Trust-region radius: {tr_radius:.3e}")
+        
+            step = cd.SX.sym("step", policy_gradient.shape)
+            obj = - (m_hat.T @ step + 0.5 * step.T @ D_hat @ step)
+            constr = step.T @ step
+
+            nlp_dict = {
+                "x": step,
+                "f": obj,
+                "g": constr,
+            }
+            nlpsol_options = {
+                "print_time": False,
+                "ipopt.print_level": 0,
+                "ipopt.sb": "yes",
+            }
+
+            solver = cd.nlpsol("solver", "ipopt", nlp_dict, nlpsol_options)
+
+            lam_g0 = -(-np.abs(np.linalg.eigh(D_hat)[0])).max() * 0.5
+            sol = solver(x0 = update, lam_g0 = lam_g0, lbg = tr_radius ** 2, ubg = tr_radius ** 2)
+            
+            if solver.stats()["return_status"] == "Solve_Succeeded":
+                print("Trust-region subproblem solved successfully.")
+            else:
+                print("Warning: Trust-region subproblem solver returned with status: ", solver.stats()["return_status"])
+            update = sol["x"].full()
+
+        return update, m_hat, D_hat
     
-
-
 class RL_MPC_AN_agent(RL_MPC_GN_agent):
 
-    def __init__(self, mpc: RL_MPC, settings_dict: dict = {}, init_differentiator: bool = True):
-        super().__init__(mpc, settings_dict, False)
+    def __init__(self, mpc: RL_MPC, settings_dict: dict = {}, init_differentiator: bool = True, **kwargs):
+        super().__init__(mpc, settings_dict, False, **kwargs)
 
         if init_differentiator:
-            self.differentiator = NLP_differentiator(self.mpc, second_order = True)
+            self.differentiator_p = NLP_differentiator(self.mpc, ["_p"], second_order = True,)
+            self.differentiator_s = NLP_differentiator(self.mpc, ["_x0", "_u_prev"], second_order = True,)
             self.flags.differentiator_initialized = True
+
+        self.D = np.zeros((self.mpc.model._p.shape[0], self.mpc.model._p.shape[0]))
 
     def act(self, state: np.ndarray, old_action: np.ndarray,  training: bool = False):
         action = self.mpc.make_step(state, old_action)
@@ -911,200 +962,286 @@ class RL_MPC_AN_agent(RL_MPC_GN_agent):
             print("\nThe solver did not converge. The action is not used for training.")
         
         if self.mpc.solver_stats["success"]:
-            jac_action_parameters, jac_jac_action_parameters = self.differentiator.jac_jac_action_parameters_parameters(self.mpc)
+            jac_action_parameters, jac_jac_action_parameters = self.differentiator_p.jac_jac_action_parameters_parameters(self.mpc)
+            jac_action_state, jac_jac_action_state = self.differentiator_s.jac_jac_action_parameters_parameters(self.mpc)
         else:
-            jac_action_parameters = np.zeros((self.mpc.model._u.shape[0], self.mpc.model._p.shape[0]))
-            jac_jac_action_parameters = np.zeros((self.mpc.model._u.shape[0], self.mpc.model._p.shape[0], self.mpc.model._p.shape[0]))
+            jac_action_parameters = np.zeros((self.differentiator_p.n_u, self.differentiator_p.n_p))
+            jac_action_state = np.zeros((self.differentiator_s.n_u, self.differentiator_s.n_p))
+            jac_jac_action_parameters = np.zeros((self.differentiator_p.n_u, self.differentiator_p.n_p, self.differentiator_p.n_p))
+            jac_jac_action_state = np.zeros((self.differentiator_s.n_u, self.differentiator_s.n_p, self.differentiator_s.n_p))
 
         action_dict = {
             "action": action,
             "jac_action_parameters": jac_action_parameters,
+            "jac_action_state": jac_action_state,
             "jac_jac_action_parameters": jac_jac_action_parameters,
+            "jac_jac_action_states": jac_jac_action_state,
             "success": self.mpc.solver_stats["success"],
         }
 
         return action_dict
     
-    def remember_transition_for_V_func(
+    def remember_transition_for_Q_func(
             self,
             state: np.ndarray,
-            previous_action: np.ndarray,
             taken_action: np.ndarray,
+            jac_action_prev_state:np.ndarray,
             jac_action_parameters:np.ndarray,
-            jac_jac_action_parameters: np.ndarray,
+            jac_jac_action_parameters:np.ndarray,
+            jac_jac_action_state:np.ndarray,
             reward: float,
+            grad_reward_state: np.ndarray,
+            grad_reward_action: np.ndarray,
+            hess_reward_state: np.ndarray,
+            hess_reward_action: np.ndarray,
+            jac_jac_reward_state_action: np.ndarray,
             next_state: np.ndarray,
+            jac_next_state_previous_state: np.ndarray,
+            jac_next_state_taken_action: np.ndarray,
+            jac_jac_next_state_previous_state: np.ndarray,
+            jac_jac_next_state_taken_action: np.ndarray,
+            jac_jac_next_state_state_action: np.ndarray,
             termination: bool,
             truncation: bool
             ):
-        self.V_func_transition_memory.append(
+        self.Q_func_transition_memory.append(
             (
                 state,
-                previous_action,
                 taken_action,
+                jac_action_prev_state,
                 jac_action_parameters,
                 jac_jac_action_parameters,
+                jac_jac_action_state,
                 reward,
+                grad_reward_state,
+                grad_reward_action,
+                hess_reward_state,
+                hess_reward_action,
+                jac_jac_reward_state_action,
                 next_state,
+                jac_next_state_previous_state,
+                jac_next_state_taken_action,
+                jac_jac_next_state_previous_state,
+                jac_jac_next_state_taken_action,
+                jac_jac_next_state_state_action,
                 termination,
                 truncation,
             )
         )
+    
+    def _compute_observed_clc(self):
+        observed_clc = []
 
+        for episode_idx, episode in enumerate(self.episodes_for_action_value_function):
+            episode_clc = 0.0
+            for trans_idx, transition in enumerate(reversed(episode)): 
+                reward = transition[6]
+                episode_clc = reward + self.settings.gamma * episode_clc
+            
+            observed_clc.append(episode_clc)
+        
+        observed_clc = np.stack(observed_clc).mean()
+
+        return observed_clc
+    
     def _prepare_calculations(self):
 
-        ### First do everything for the state value function
-        observed_states = []
-        observed_previous_actions = []
+        ### Collect everything for gradient of the action-value function
+        states = []
 
-        observed_taken_action = []
-        observed_jac_taken_action_parameters = []
-        observed_jac_jac_taken_action_parameters = []
+        taken_actions = []
+        jacs_taken_action_parameters = []
+        jacs_taken_action_state = []
+        jacs_jac_taken_action_parameters = []
 
-        observed_rewards = []
+        rewards = []
+        grads_rewards_state = []
+        grads_rewards_action = []
+        d_reward_d_state = []
 
-        observed_next_state = []
+        next_states = []
+        d_next_state_d_state = []
+        d_next_state_d_action = []
 
-        observed_v_values = []
+        terminations = []
+        truncations = []
 
-        observed_termination = []
-        observed_truncation = []
+        d_Q_d_a_list = []
+        d_Q_d_s_list = []
 
-        for episode in self.episodes_for_state_value_function:
-            for idx, (state, previous_action, taken_action, jac_action_parameters, jac_jac_action_parameters, reward, next_state, termination, truncation) in enumerate(reversed(episode)):
-                
-                if idx == 0:
-                    v_value = reward
-                else:
-                    v_value = reward + self.settings.gamma * v_value
+        d2_Q_d_a2_list = []
+        d2_Q_d_s2_list = []
 
-                observed_states.append(state)
-                observed_previous_actions.append(previous_action)
+        jacs_taken_action_parameters_test = []
+        jacs_jac_taken_action_parameters_test = []
+        d_Q_d_a_list_test = []
+        d2_Q_d_a2_list_test = []
 
-                observed_taken_action.append(taken_action)
-                observed_jac_taken_action_parameters.append(jac_action_parameters)
-                observed_jac_jac_taken_action_parameters.append(jac_jac_action_parameters)
+        v_values_test = []
 
-                observed_rewards.append(reward)
-
-                observed_next_state.append(next_state)
-
-                observed_v_values.append(v_value)
-
-                observed_termination.append(termination)
-                observed_truncation.append(truncation)
-            pass
-
-        self.observed_states = np.hstack(observed_states).T
-        self.observed_previous_actions = np.hstack(observed_previous_actions).T
-
-        self.observed_taken_actions = np.hstack(observed_taken_action).T
-        self.observed_jac_taken_action_parameters = np.stack(observed_jac_taken_action_parameters)
-        self.observed_jac_jac_taken_action_parameters = np.stack(observed_jac_jac_taken_action_parameters)
-
-        self.observed_rewards = np.array(observed_rewards).reshape(-1, 1)
-
-        self.observed_next_state = np.hstack(observed_next_state).T
-
-        self.observed_v_values = np.array(observed_v_values).reshape(-1, 1)
-
-        self.observed_termination = np.array(observed_termination).reshape(-1, 1)
-        self.observed_truncation = np.array(observed_truncation).reshape(-1, 1)
+        grad_V_theta_episode_list = []
+        hess_V_theta_episode_list = []
 
 
 
-        ### Now do everything for the action value function
-        explored_states = []
-        explored_previous_actions = []
-
-        explored_taken_actions = []
-
-        explored_rewards = []
-
-        explored_next_states = []
-
-        explored_termination = []
-        explored_truncation = []
 
         for episode in self.episodes_for_action_value_function:
-            for idx, (state, previous_action, taken_action, reward, next_state, termination, truncation) in enumerate(reversed(episode)):
-                explored_states.append(state)
-                explored_previous_actions.append(previous_action)
+            jac_action_parameters_per_episode = []
+            jac_jac_action_parameters_per_episode = []
+            grad_Q_a_per_episode = []
+            hess_Q_a_per_episode = []
 
-                explored_taken_actions.append(taken_action)
+            for idx, (state, taken_action, jac_action_prev_state, jac_action_parameters, jac_jac_action_parameters, jac_jac_action_state, reward, grad_reward_state, grad_reward_action, hess_reward_state, hess_reward_action, jac_jac_reward_state_action, next_state, jac_next_state_previous_state, jac_next_state_taken_action, jac_jac_next_state_previous_state, jac_jac_next_state_taken_action, jac_jac_next_state_state_action, termination, truncation) in enumerate(reversed(episode)):              
+                states.append(state)
 
-                explored_rewards.append(reward)
+                taken_actions.append(taken_action)
+                jacs_taken_action_parameters.append(jac_action_parameters)
+                jacs_taken_action_state.append(jac_action_prev_state)
 
-                explored_next_states.append(next_state)
+                rewards.append(reward)
+                grads_rewards_state.append(grad_reward_state)
+                grads_rewards_action.append(grad_reward_action)
+                jacs_jac_taken_action_parameters.append(jac_jac_action_parameters)
 
-                explored_termination.append(termination)
-                explored_truncation.append(truncation)
+                next_states.append(next_state)
+                d_next_state_d_state.append(jac_next_state_previous_state)
+                d_next_state_d_action.append(jac_next_state_taken_action)
 
-        self.explored_states = np.hstack(explored_states).T
-        self.explored_previous_actions = np.hstack(explored_previous_actions).T
+                terminations.append(termination)
+                truncations.append(truncation)
 
-        self.explored_taken_actions = np.hstack(explored_taken_actions).T
+                d_r_d_s = grad_reward_state + jac_action_prev_state.T @ grad_reward_action
+                d_s_next_d_s = jac_next_state_previous_state + jac_next_state_taken_action @ jac_action_prev_state
 
-        self.explored_rewards = np.array(explored_rewards).reshape(-1, 1)
+                d2_r_d_s2 = hess_reward_state + jac_action_prev_state.T @ hess_reward_action @ jac_action_prev_state
+                d2_r_d_s2 += jac_jac_reward_state_action @ jac_action_prev_state +(jac_jac_reward_state_action @ jac_action_prev_state).T
+                d2_r_d_s2 += tensor_vector_product(jac_jac_action_state, grad_reward_action)
 
-        self.explored_next_states = np.hstack(explored_next_states).T
+                d2_s_next_d_s2 = jac_jac_next_state_previous_state + matrix_tensor_matrix_product(jac_action_prev_state.T, jac_jac_next_state_taken_action, jac_action_prev_state)
+                d2_s_next_d_s2 += tensor_matrix_product(jac_jac_action_state, jac_next_state_taken_action)
+                d2_s_next_d_s2 += matrix_tensor_matrix_product(np.eye(jac_jac_next_state_state_action.shape[1]), jac_jac_next_state_state_action, jac_action_prev_state)
+                d2_s_next_d_s2 += matrix_tensor_matrix_product(jac_action_prev_state.T, np.transpose(jac_jac_next_state_state_action, axes = [0, 2, 1]), np.eye(np.transpose(jac_jac_next_state_state_action, axes = [0, 2, 1]).shape[2]))
 
-        self.explored_termination = np.array(explored_termination).reshape(-1, 1)
-        self.explored_truncation = np.array(explored_truncation).reshape(-1, 1)
+                if idx == 0:
+                    d_Q_d_a = grad_reward_action.copy()
+                    d2_Q_d_a2 = hess_reward_action.copy()
 
-        return
+                    d_Q_d_s = d_r_d_s.copy()   
+                    d2_Q_d_s2 = d2_r_d_s2.copy()   
+                    
+                    v_value = reward
+
+                else:
+                    d_Q_d_a = grad_reward_action + self.settings.gamma * jac_next_state_taken_action.T @ d_Q_d_s
+
+                    d2_Q_d_a2 = hess_reward_action.copy()
+                    d2_Q_d_a2 += self.settings.gamma * (jac_next_state_taken_action.T @ d2_Q_d_s2 @ jac_next_state_taken_action)
+                    d2_Q_d_a2 += self.settings.gamma * tensor_vector_product(jac_jac_next_state_taken_action, d_Q_d_s)
+
+                    d2_Q_d_s2 = d2_r_d_s2.copy() + self.settings.gamma * (d_s_next_d_s.T @ d2_Q_d_s2 @ d_s_next_d_s)
+                    d2_Q_d_s2 += self.settings.gamma * tensor_vector_product(d2_s_next_d_s2, d_Q_d_s)
+
+                    d_Q_d_s = d_r_d_s + self.settings.gamma * d_s_next_d_s.T @ d_Q_d_s
+
+                    v_value = reward + self.settings.gamma * v_value
+
+                d_Q_d_a_list.append(d_Q_d_a)
+                d_Q_d_s_list.append(d_Q_d_s)
+
+                d2_Q_d_a2_list.append(d2_Q_d_a2)
+                d2_Q_d_s2_list.append(d2_Q_d_s2)
+                v_values_test.append(v_value)
+
+                jac_action_parameters_per_episode.append(jac_action_parameters)
+                jac_jac_action_parameters_per_episode.append(jac_jac_action_parameters)
+                grad_Q_a_per_episode.append(d_Q_d_a)
+                hess_Q_a_per_episode.append(d2_Q_d_a2)
+
+            jacs_taken_action_parameters_test.append(jac_action_parameters)
+            jacs_jac_taken_action_parameters_test.append(jac_jac_action_parameters)
+            d_Q_d_a_list_test.append(d_Q_d_a)
+            d2_Q_d_a2_list_test.append(d2_Q_d_a2)
+
+            # Compute the gradient and hessian of the state-value function for this episode
+            jac_action_parameters_per_episode.reverse()
+            grad_Q_a_per_episode.reverse()
+            jac_jac_action_parameters_per_episode.reverse()
+            hess_Q_a_per_episode.reverse()
+            grad_V_theta = self._compute_grad_V_theta(jac_action_parameters_per_episode, grad_Q_a_per_episode)
+            hess_V_theta = self._compute_hess_V_theta_approx_newton(jac_action_parameters_per_episode, jac_jac_action_parameters_per_episode, grad_Q_a_per_episode, hess_Q_a_per_episode)
+            grad_V_theta_episode_list.append(grad_V_theta)
+            hess_V_theta_episode_list.append(hess_V_theta)
+
+        self.observed_states = np.hstack(states).T
+
+        self.observed_taken_actions = np.hstack(taken_actions).T
+        self.observed_jac_taken_action_parameters = np.stack(jacs_taken_action_parameters)
+        self.observed_jac_taken_action_state = np.stack(jacs_taken_action_state)
+        self.observed_jac_jac_taken_action_parameters = np.stack(jacs_jac_taken_action_parameters)
+
+        self.observed_rewards = np.array(rewards).reshape(-1, 1)
+        self.observed_grad_rewards_state = np.stack(grads_rewards_state)
+        self.observed_grad_rewards_action = np.stack(grads_rewards_action)
+
+        self.observed_next_states = np.hstack(next_states).T
+        self.observed_d_next_state_d_state = np.stack(d_next_state_d_state).T
+        self.observed_d_next_state_d_action = np.stack(d_next_state_d_action).T
+
+        self.observed_termination = np.array(terminations).reshape(-1, 1)
+        self.observed_truncation = np.array(truncations).reshape(-1, 1)
+
+        self.grad_Q_a = np.hstack(d_Q_d_a_list).T
+        self.grad_Q_s = np.hstack(d_Q_d_s_list).T
+
+        self.hess_Q_a = np.stack(d2_Q_d_a2_list)
+        self.hess_Q_s = np.stack(d2_Q_d_s2_list)
+
+        self.grad_Q_a_test = np.hstack(d_Q_d_a_list_test).T
+        self.hess_Q_a_test = np.stack(d2_Q_d_a2_list_test)
+
+        self.observed_jac_taken_action_parameters_test = np.stack(jacs_taken_action_parameters_test)
+        self.observed_jac_jac_taken_action_parameters_test = np.stack(jacs_jac_taken_action_parameters_test)
+
+        self.v_values_test = np.array(v_values_test).reshape(-1, 1)
+
+        self.grad_V_theta = np.stack(grad_V_theta_episode_list)
+        self.hess_V_theta = np.stack(hess_V_theta_episode_list)
+
+        policy_gradient = self.grad_V_theta.mean(axis = 0)
+        policy_hessian = self.hess_V_theta.mean(axis = 0)
+
+        return policy_gradient, policy_hessian
     
     def replay(self):
-        self._prepare_calculations()
+        start_time_replay = time.time()
 
-        if self.settings.use_scaled_actions:
-            self._scale_actions()
+        observed_clc = self._compute_observed_clc()
+        print(f"Observed CLC: {observed_clc:.4f}")
 
-        if self.settings.q_func_always_reset:
-            # Reset the q_func model
-            self.q_func = self._prepare_q_func()
-
-        
-        self._learn_q_function(
-            self.observed_states,
-            self.observed_previous_actions,
-            self.observed_taken_actions,
-            self.observed_rewards,
-            self.observed_v_values,
-            self.observed_next_state,
-            self.observed_termination,
-            self.explored_states,
-            self.explored_previous_actions,
-            self.explored_taken_actions,
-            self.explored_rewards,
-            self.explored_next_states,
-            self.explored_termination,
-            )
-
-
-        # Get everything for the policy gradient
-        a_values, grad_Q_a, hess_Q_a = self._get_Q_hessian(self.observed_states, self.observed_previous_actions, self.observed_taken_actions)
-
-        if self.settings.clip_jac_policy:
-            where_at_upper_bound = np.where(np.isclose(self.observed_taken_actions - self.mpc._u_ub.master.T.full(), 0, atol = 1e-6))
-            self.observed_jac_taken_action_parameters[where_at_upper_bound] = np.clip(self.observed_jac_taken_action_parameters[where_at_upper_bound], a_max = 0, a_min = None)
-
-            where_at_lower_bound = np.where(np.isclose(self.observed_taken_actions - self.mpc._u_lb.master.T.full(), 0, atol = 1e-6))
-            self.observed_jac_taken_action_parameters[where_at_lower_bound] = np.clip(self.observed_jac_taken_action_parameters[where_at_lower_bound], a_min = 0, a_max = None)
-
-
-        policy_gradient = self.compute_policy_gradient(self.observed_jac_taken_action_parameters, grad_Q_a)
-        policy_hessian = self.compute_approximate_Newton_matrix(self.observed_jac_taken_action_parameters, self.observed_jac_jac_taken_action_parameters, grad_Q_a, hess_Q_a)
-
+        policy_gradient, policy_hessian = self._prepare_calculations()
         policy_hessian = self._regularize_policy_hessian(policy_hessian, self.observed_jac_taken_action_parameters)
-        print(f"Policy gradient: {policy_gradient}")
-        print(f"Policy hessian: {policy_hessian}")
 
-        update = self._compute_update(policy_gradient, policy_hessian)
+        print(f"Policy gradient:")
+        print(policy_gradient)
+        print(f"Policy hessian:")
+        print(policy_hessian)
+
+        update, m_hat, D_hat = self._compute_update(policy_gradient, policy_hessian)
+        print(f"Parameter update:")
+        print(update)
+
+        predicted_clc = RL_MPC_AN_agent._compute_predicted_clc(observed_clc, m_hat, D_hat, update)
+        print(f"Predicted CLC after update: {predicted_clc:.4f}")
 
         self._update_parameters(update)
+        
 
         self.episodes_for_action_value_function = []
-        self.episodes_for_state_value_function = []
+
+        end_time_replay = time.time()
+        self._time_replay = end_time_replay - start_time_replay
+
+        # Track performance metrics
+        self.performance_data.update(self)
 
         return policy_gradient, policy_hessian

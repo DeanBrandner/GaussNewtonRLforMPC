@@ -1,12 +1,10 @@
-import pickle
-import os
+import os, pickle, time
 
 import casadi as cd
 import numpy as np
 
 from do_mpc.controller import MPC
 import copy
-import time
 import warnings
 
 
@@ -764,8 +762,8 @@ class RL_MPC(MPC):
         model = attributes.pop("model")
         mpc = cls(model)
 
-        settings = attributes.pop("settings")
-        mpc.settings = settings
+        _settings = attributes.pop("_settings")
+        mpc.settings = _settings
 
         lterm = attributes.pop("lterm_fun")(model._x, model._u, model._z, model._tvp, model._p)
         mterm = attributes.pop("mterm_fun")(model._x, model._z, model._tvp, model._p)

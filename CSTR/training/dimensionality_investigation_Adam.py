@@ -1,24 +1,43 @@
-import os
-import pickle
+import os, pickle, time, gc
 import pandas as pd
 import numpy as np
 
-from mpc_collection import get_rl_mpc
-from mp_utils import run_episode_loop
-
-from rl_mpc_agents import RL_MPC_GN_agent as Agent
-
-from environments import CSTR as Environment
 from multiprocessing import Process, Queue, Value
-
 from tqdm import tqdm
-import time
 
-def train(n_processes:int, agent_path:str, rl_settings: dict = {}, n_episodes_per_replay: int = 50):
+from mp_utils import run_episode_loop
+from rl_mpc_agents import RL_MPC_GA_agent as Agent
+from environments import CSTR as Environment
 
-    mpc = get_rl_mpc()
+global_seed = 42
+
+
+def train(
+        n_processes:int,
+        penalty_weights,
+        agent_path:str,
+        rl_settings: dict = {},
+        n_episodes_per_replay: int = 50,
+        parameterization: str = "low",
+        ):
+
+    if parameterization == "low":
+        from mpc_collection import get_rl_mpc
+    elif parameterization == "medium":
+        from mpc_collection import get_rl_mpc_medium_parameterized as get_rl_mpc
+    elif parameterization == "high":
+        from mpc_collection import get_rl_mpc_high_parameterized as get_rl_mpc
+    else:
+        raise ValueError(f"Unknown parameterization: {parameterization}")
+
+    mpc = get_rl_mpc(penalty_weights)
 
     agent = Agent(mpc, rl_settings, init_differentiator = True)
+    parameters = mpc.p_fun(0).master
+
+    p_template = agent.mpc.get_p_template(1)
+    p_template.master = parameters
+    mpc.set_p_fun(lambda t_now: p_template)
 
     task_queue = Queue()
     environment_queue = Queue()
@@ -29,16 +48,15 @@ def train(n_processes:int, agent_path:str, rl_settings: dict = {}, n_episodes_pe
     # Start the workers
     workers = []
     for i in range(n_processes):
-        worker = Process(target = run_episode_loop, args = (get_rl_mpc, Agent, rl_settings, Environment, agent_path, task_queue, environment_queue, progress_counter))
+        worker = Process(target = run_episode_loop, args = (get_rl_mpc, penalty_weights, Agent, rl_settings, Environment, agent_path, task_queue, environment_queue, progress_counter))
         workers.append(worker)
         worker.start()
 
     agent.save(os.path.join(agent_path, f"agent_update"))
     agent.save_rl_parameters(os.path.join(agent_path, f"agent_update_0"))
-    agent.save_q_func(os.path.join(agent_path, f"agent_update_0"))
 
     # Do the training
-    n_replays = 101
+    n_replays = 51
 
     unprocessed_results_list= []
     processed_results_list = []
@@ -63,6 +81,10 @@ def train(n_processes:int, agent_path:str, rl_settings: dict = {}, n_episodes_pe
                 "parameters": agent.mpc.p_fun(0).master,
                 "max_steps_of_violation": 1,  # This can be adjusted based on the environment
                 "training": True,
+                "measurement_noise": False,
+                "additive_process_noise": True,
+                "parametric_uncertainty": True,
+                "diff_twice": False
             })
 
         gathered_results = []
@@ -70,7 +92,7 @@ def train(n_processes:int, agent_path:str, rl_settings: dict = {}, n_episodes_pe
             env_results = environment_queue.get()
 
             gathered_results.append(env_results)
-            
+
             with progress_counter.get_lock():
                 completed = progress_counter.value
             pbar_episodes.n = completed
@@ -86,7 +108,8 @@ def train(n_processes:int, agent_path:str, rl_settings: dict = {}, n_episodes_pe
         episode_time_list = []
         for result in gathered_results:
             data = result["data"]
-            cum_reward_list.append(data.r.sum())
+            cum_reward = [agent.settings.gamma ** k * item for k, item in enumerate(data.r)]
+            cum_reward_list.append(np.sum(cum_reward))
             stage_cost_list.append(data.stage_cost.sum())
             penalty_list.append(data.penalty.sum())
             termination_list.append(int(result["termination"]))
@@ -114,16 +137,15 @@ def train(n_processes:int, agent_path:str, rl_settings: dict = {}, n_episodes_pe
             pickle.dump(processed_results_list, f)
         
 
-        policy_gradient, policy_hessian = agent.replay()
+        policy_gradient = agent.replay()
 
         print(agent.mpc.p_fun(0)["_p"])
 
         agent.save_rl_parameters(os.path.join(agent_path, f"agent_update_{replay_idx + 1}"))
-        agent.save_q_func(os.path.join(agent_path, f"agent_update_{replay_idx + 1}"))
         with open(os.path.join(agent_path, f"agent_update_{replay_idx}", "policy_gradients.pkl"), "wb") as f:
             pickle.dump(policy_gradient, f)
-        with open(os.path.join(agent_path, f"agent_update_{replay_idx}", "policy_hessian.pkl"), "wb") as f:
-            pickle.dump(policy_hessian, f)
+
+        agent.performance_data.to_csv(os.path.join(agent_path, "performance_data.csv"))
 
         end_time = time.time()
 
@@ -145,65 +167,48 @@ def train(n_processes:int, agent_path:str, rl_settings: dict = {}, n_episodes_pe
     return
 
 if __name__ == "__main__":
-    n_mpc_processes = min(int(os.cpu_count() / 2) - 1, 50)
-    n_episodes_per_replay = 100
 
-    actor_learning_rate = 0.1
-    use_momentum = True
-    use_adam = False
+    n_mpc_processes = min(int(os.cpu_count() // 2) - 1, 50)
+    n_episodes_per_replay = 200
 
-    # You can enter multiple values for beta and eta in these lists.
-    # Example: momentum_beta_list = [0.75, 0.9, 0.99] 
-    momentum_beta_list = [0.75]
-    momentum_eta_list = [0.9]
+    parameterization_list = ["low", "medium", "high"]
 
-    omega_list = [1e2]
-
-    for momentum_beta in momentum_beta_list:
-        for momentum_eta in momentum_eta_list:
-            for omega in omega_list:
-                omegainv = 1/omega
-
-                rl_settings = {
-                        "gamma": 1.0,
-                        "exploration_noise": 1e-2 * np.abs(np.array([40 - 5, -8500 - 0])).reshape(-1, 1),
-                        "exploration_distribution": "normal",
-                        "exploration_seed": 1,
-                        "actor_learning_rate": actor_learning_rate,
-
-                        "q_func_architecture": [64, 32],
-                        "q_func_activation": "gelu",
-                        "q_func_optimizer": "adam",
-                        "q_func_learning_rate": 1e-3,
-                        "q_func_loss": "mse",
-                        "q_func_batch_size": 128,
-                        "q_func_epochs": 500,
-                        "q_func_always_reset": False,
-
-                        "regularization": "pos_eigen",
-                        "clip_q_gradients": True,
-                        "clip_jac_policy": True,
-                        "use_momentum": use_momentum,
-                        "use_adam": use_adam,
-                        "momentum_beta": momentum_beta,
-                        "momentum_eta": momentum_eta,
-                        "omegainv": omegainv,
-                    }
+    penalty_weights = 1e2
 
 
-                agent_path = os.path.join("CSTR", "data", "gauss_newton", f"lr{actor_learning_rate:.1e}_nIC{n_episodes_per_replay}_beta{momentum_beta:.2f}_eta{momentum_eta:.3f}_omegainv{omegainv:.1e}")
+    actor_learning_rate = 1e-2
+    gamma = 0.99
 
-                start_time = time.time()
-                train(n_mpc_processes, agent_path, rl_settings, n_episodes_per_replay)
-                end_time = time.time()
+    rl_settings = {
+            "gamma": gamma,
+            "actor_learning_rate": actor_learning_rate,
+            "use_momentum": False,
+            "use_adam": True,
+        }
 
-                print(f"Training time: {end_time - start_time:.2f} seconds")
-                print(f"Training time: {(end_time - start_time) / 60:.2f} minutes")
-                print(f"Training time: {(end_time - start_time) / 3600:.2f} hours")
-                print(f"Training time: {(end_time - start_time) / 86400:.2f} days")
+    for parameterization in parameterization_list:
+        agent_path = os.path.join(
+            "CSTR",
+            "data",
+            "dimensionality_investigation",
+            f"gamma{gamma:.3f}, n_IC_per_replay{n_episodes_per_replay}",
+            f"Adam_lr_{actor_learning_rate:.1e}",
+            f"{parameterization}_parameterization",
+        )
 
-                with open(os.path.join(agent_path, "training_time.txt"), "w") as f:
-                    f.write(f"Training time: {end_time - start_time:.2f} seconds\n")
-                    f.write(f"Training time: {(end_time - start_time) / 60:.2f} minutes\n")
-                    f.write(f"Training time: {(end_time - start_time) / 3600:.2f} hours\n")
-                    f.write(f"Training time: {(end_time - start_time) / 86400:.2f} days\n")
+        gc.collect()
+                
+        start_time = time.time()
+        train(n_mpc_processes, penalty_weights, agent_path, rl_settings, n_episodes_per_replay, parameterization)
+        end_time = time.time()
+
+        print(f"Training time: {end_time - start_time:.2f} seconds")
+        print(f"Training time: {(end_time - start_time) / 60:.2f} minutes")
+        print(f"Training time: {(end_time - start_time) / 3600:.2f} hours")
+        print(f"Training time: {(end_time - start_time) / 86400:.2f} days")
+
+        with open(os.path.join(agent_path, "training_time.txt"), "w") as f:
+            f.write(f"Training time: {end_time - start_time:.2f} seconds\n")
+            f.write(f"Training time: {(end_time - start_time) / 60:.2f} minutes\n")
+            f.write(f"Training time: {(end_time - start_time) / 3600:.2f} hours\n")
+            f.write(f"Training time: {(end_time - start_time) / 86400:.2f} days\n")
